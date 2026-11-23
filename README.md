@@ -29,6 +29,8 @@ natively, and the door stays open to turn it into a VST plugin.
 | PERFORMER | Plays solo phrases in any of the 12 keys (see below). |
 | 3X OSC | Three detuned oscillator pairs (sine → triangle → saw), filter, swell envelope, stereo. Pitches from P1–P3, swells on GATE, a drone when GATE is unpatched. |
 | LFO | Slow sine, triangle, smooth drift and sample-and-hold for modulation. |
+| DRUMS | 16 drum kits with 16 pads each, every pad with its own trigger input (see below). |
+| SAMPLER | Plays regions of an audio file between up to 8 markers (see below). |
 | TAPE | A tape loop that plays, records and overdubs (see below). |
 | REVERB | Large, modulated 8-line feedback delay network. |
 | OUTPUT | Final destination with soft limiter, scope and meters. |
@@ -64,6 +66,36 @@ PERFORMER plays solo lines the way a player would in blues, jazz, rock or pop, s
 - Some phrases slide into notes.
 
 The factory presets *chord arpeggio* and *pentatonic performer* show both modules in a patch.
+
+## Drums
+
+DRUMS has 16 pads, each with its own trigger input: two kicks (BD1, BD2), two snares, clap, rim, closed and open hi-hat, crash, ride, three toms, plus a bell, a shaker and one percussion sound (cowbell, clave, conga, tambourine and so on, depending on the kit). Click a pad to hear it; the closed hat cuts off the open one, as on the original machines.
+
+There are 16 kits: **808, 909, 707, 606, CR-78, 303 GROOVE, 404 DUST, LM DRUM, DMX, SDS-V, STUDIO, BRUSHES, TAPE LOFI, VINYL, 8-BIT** and **FELT**.
+
+- **How they're made:** all kits are synthesized the way the originals worked, not stored as recordings. Examples:
+  - the 808's pitch-swept sine kick, its two-tone snare, and hats and cymbals from its six square oscillators;
+  - the 909's sweeping kick, with 6-bit cymbals;
+  - the 8-bit companded samples of the LM-1 and DMX;
+  - the Simmons tom sweep;
+  - real cymbals as many inharmonic partials.
+- **Character:** each kit is then given the colour of its machine: sample rate, bit depth, saturation, tape roll-off, or vinyl crackle and hiss.
+- **Rendering:** a kit is rendered when first used and pre-renders in the background, so switching never interrupts the audio.
+- **Checked against references:** measured against documented behaviour, for example the 808 kick settling at 49 Hz, its cowbell at 540 and 800 Hz, and the 909 kick sweeping from about 250 Hz.
+- **Knobs:** **KIT**, **TUNE** (±12 semitones), **DECAY** (shortens every sound), **TONE** (darker ↔ thinner), **DRIVE** and **LEVEL**.
+
+The factory presets *808 groove* and *dusty vinyl beat* drive DRUMS from three sequencers.
+
+## Sampler
+
+SAMPLER loads an audio file of up to 10 minutes (WAV, MP3, OGG, FLAC, QOA) with **LOAD** or by dropping it onto the module. The waveform is coloured by frequency content: warm rose for lows, then amber and green, cool blue for highs.
+
+- **View:** use the mouse wheel over the waveform to zoom, down to single cycles. Drag to scroll, click the overview strip to jump, and double-click to see the whole file.
+- **Markers:** click the strip above the waveform to place up to 8 markers, drag them to move, and right-click one to remove it. **AUTO** places them on the strongest hits.
+- **Playing:** **PLAY n** plays from marker *n* until the next marker (or the end of the file), and **STOP n** stops it early. Pads 1–8 audition the regions.
+- **Knobs:** **PITCH** (±24 semitones, plus the PITCH input in octaves), **FADE** (in/out), **VOICES** (POLY lets regions overlap; MONO plays one at a time) and **LEVEL**.
+
+Loaded audio is stored with the project, like the tapes.
 
 ## Tape
 

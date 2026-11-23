@@ -29,7 +29,7 @@
 #define SR           48000.0f
 #define TAU          6.28318530718f
 #define MAX_MODULES  64
-#define MAX_IO       8
+#define MAX_IO       20
 #define MAX_KNOBS    12
 #define MAX_CABLES   256
 #define MAX_SRC      8
@@ -129,6 +129,13 @@ typedef struct {
     void (*save)(const Module *, char *out, int cap);
     void (*load)(Module *, const char *data);
     void (*fini)(Module *);   // optional: free what init allocated besides st
+    // optional: audio stored with the project (tape, sampler)
+    unsigned *(*audio_id)(Module *);
+    bool (*audio_save)(Module *, const char *path, int how);
+    void (*audio_load)(Module *, const char *path);
+    // optional: mouse wheel and right-click inside the custom area
+    bool (*wheel)(Module *, Vector2 mouse, Rectangle area, float amount);
+    bool (*rpress)(Module *, Vector2 mouse, Rectangle area);
 } ModDef;
 
 struct Module {
@@ -150,10 +157,21 @@ static Cable  cables[MAX_CABLES];
 static int    ncables;
 static int    next_color;
 static bool   sel[MAX_MODULES];   // selected in the UI
+static volatile bool g_running = true;   // transport: STOP pauses all processing
+
+// In the browser the audio callback runs on the main thread, so the UI may
+// hand buffers to a module directly; natively the audio thread takes them.
+#if defined(PLATFORM_WEB)
+#define UI_OWNS_AUDIO 1
+#else
+#define UI_OWNS_AUDIO (!g_running)
+#endif
+
+enum { SAVE_LATER, SAVE_NOW, SAVE_ALL };   // how urgently a module stores its audio
 static volatile int g_route;  // routing copy the audio thread should use
 static int    g_cur;          // routing copy used during the current audio block
 
-enum { M_CLOCK, M_SEQ, M_CHORD, M_OSC3, M_LFO, M_REVERB, M_OUT, M_TAPE, M_ARP, M_PERF, M_COUNT };
+enum { M_CLOCK, M_SEQ, M_CHORD, M_OSC3, M_LFO, M_REVERB, M_OUT, M_TAPE, M_ARP, M_PERF, M_DRUMS, M_SAMPLER, M_COUNT };
 static const ModDef DEFS[M_COUNT];
 
 static float IN(Module *m, int i)
@@ -840,15 +858,18 @@ static int tape_len(const Module *m)
     return clampi((int)(m->p[0] * SR), 64, s->cap > 64 ? s->cap : 64);
 }
 
+static void tape_take(TapeSt *s)   // take the buffer the UI handed over
+{
+    s->old = s->buf;
+    s->buf = s->next; s->cap = s->nextCap; s->next = NULL;
+    if (!s->nextKeep) s->h = 0;
+    s->swap = 0;
+}
+
 static void tape_process(Module *m)
 {
     TapeSt *s = m->st;
-    if (s->swap) {
-        s->old = s->buf;
-        s->buf = s->next; s->cap = s->nextCap; s->next = NULL;
-        if (!s->nextKeep) s->h = 0;
-        s->swap = 0;
-    }
+    if (s->swap) tape_take(s);
     float inL = IN(m, 0), inR = HAS(m, 1) ? IN(m, 1) : inL;
     int L = tape_len(m);
     float speed = m->p[1] * exp2f(IN(m, 4));
@@ -961,9 +982,9 @@ static bool write_mp3(const char *path, const short *pcm, int frames)
 #define EXPORT_DIR "raya-data/recordings"
 #endif
 
-static bool write_wav(const char *path, const short *pcm, int frames)
+static bool write_wav(const char *path, const short *pcm, int frames, int ch)
 {
-    Wave w = { .frameCount = (unsigned int)frames, .sampleRate = (unsigned int)SR, .sampleSize = 16, .channels = 2, .data = (void *)pcm };
+    Wave w = { .frameCount = (unsigned int)frames, .sampleRate = (unsigned int)SR, .sampleSize = 16, .channels = (unsigned int)ch, .data = (void *)pcm };
     return ExportWave(w, path);
 }
 
@@ -976,7 +997,7 @@ static void export_audio(const short *pcm, int frames, bool mp3, const char *wha
     strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", localtime(&now));
     MakeDirectory(EXPORT_DIR);
     snprintf(path, sizeof path, "%s/raya-%s-%s.%s", EXPORT_DIR, what, stamp, mp3 ? "mp3" : "wav");
-    if (!(mp3 ? write_mp3(path, pcm, frames) : write_wav(path, pcm, frames))) { toast("COULD NOT WRITE THE AUDIO FILE"); return; }
+    if (!(mp3 ? write_mp3(path, pcm, frames) : write_wav(path, pcm, frames, 2))) { toast("COULD NOT WRITE THE AUDIO FILE"); return; }
 #if defined(PLATFORM_WEB)
     emscripten_run_script(TextFormat("rayaDownload('%s')", path));
 #endif
@@ -1000,6 +1021,7 @@ static void tape_draw(Module *m, Rectangle a)
 {
     TapeSt *s = m->st;
     // housekeeping on the UI thread: free retired buffers, grow the tape for TIME
+    if (s->swap && UI_OWNS_AUDIO) tape_take(s);
     if (!s->swap && s->old) { free(s->old); s->old = NULL; }
     int want = clampi((int)(m->p[0] * SR), 64, TAPE_MAX_SEC * (int)SR);
     if (!s->swap && want > s->cap) {
@@ -1096,6 +1118,28 @@ static void tape_save(const Module *m, char *out, int cap)
 {
     const TapeSt *s = m->st;
     snprintf(out, cap, "%d %d %u %s", s->rec, s->play, s->id, s->name);
+}
+
+static unsigned *tape_audio_id(Module *m) { return &((TapeSt *)m->st)->id; }
+
+// Big tapes are written less often while they keep recording.
+static bool tape_audio_save(Module *m, const char *path, int how)
+{
+    TapeSt *s = m->st;
+    int L = tape_len(m);
+    double now = GetTime();
+    if (!s->buf || (how != SAVE_ALL && !s->dirty) || (how == SAVE_LATER && now - s->savedT < 20 + L / SR * 0.5)) return false;
+    s->dirty = false;
+    s->savedT = now;
+    return write_wav(path, s->buf, L, 2);
+}
+
+static void tape_audio_load(Module *m, const char *path)
+{
+    TapeSt *s = m->st;
+    tape_read_audio(m, path);
+    s->dirty = false;
+    s->savedT = GetTime();
 }
 
 static void tape_load_data(Module *m, const char *str)
@@ -1562,6 +1606,1173 @@ static void perf_draw(Module *m, Rectangle a)
 }
 
 // ---------------------------------------------------------------------------
+// Samples — shared by SAMPLER and DRUMS: 16-bit audio at SR with a display
+// summary, a voice that plays a region of it, and a waveform view coloured
+// by frequency content (warm = low, cool = high).
+// ---------------------------------------------------------------------------
+
+#define SUM_BLOCK 256
+
+typedef struct {
+    short *data;              // interleaved, ch channels
+    int    frames, ch;
+    unsigned char *pk, *br;   // per SUM_BLOCK frames: peak and brightness, 0..255
+    int    nsum;
+} Sample;
+
+static void sample_free(Sample *s)
+{
+    free(s->data); free(s->pk); free(s->br);
+    memset(s, 0, sizeof *s);
+}
+
+// Peak and brightness per block. Brightness estimates the dominant frequency
+// from how fast the signal moves: for a sine, rms(slope) / rms = 2 sin(pi f / SR).
+static void sample_summarize(Sample *s)
+{
+    free(s->pk); free(s->br);
+    s->nsum = (s->frames + SUM_BLOCK - 1) / SUM_BLOCK;
+    s->pk = calloc(s->nsum ? s->nsum : 1, 1);
+    s->br = calloc(s->nsum ? s->nsum : 1, 1);
+    float prev = 0;
+    for (int b = 0; b < s->nsum; b++) {
+        int f0 = b * SUM_BLOCK, f1 = f0 + SUM_BLOCK < s->frames ? f0 + SUM_BLOCK : s->frames;
+        float pk = 0;
+        double e = 0, d = 0;
+        for (int f = f0; f < f1; f++) {
+            float x = 0;
+            for (int c = 0; c < s->ch; c++) x += s->data[(size_t)f * s->ch + c];
+            x /= 32768.0f * s->ch;
+            pk = fmaxf(pk, fabsf(x));
+            e += x * x;
+            d += (x - prev) * (x - prev);
+            prev = x;
+        }
+        s->pk[b] = (unsigned char)clampf(pk * 255, 0, 255);
+        if (e > 1e-9) {
+            float r = clampf((float)sqrt(d / e) / 2, 0, 1);
+            float hz = asinf(r) * SR / 3.14159265f;
+            s->br[b] = (unsigned char)(clampf(log2f(fmaxf(hz, 1) / 40.0f) / log2f(12000.0f / 40.0f), 0, 1) * 255);
+        }
+    }
+}
+
+// float [-1, 1] -> Sample (mono)
+static void sample_from_float(Sample *s, const float *y, int n)
+{
+    sample_free(s);
+    s->ch = 1;
+    s->frames = n;
+    s->data = malloc((size_t)(n ? n : 1) * sizeof(short));
+    for (int i = 0; i < n; i++) s->data[i] = (short)(clampf(y[i], -1, 1) * 32767.0f);
+    sample_summarize(s);
+}
+
+static Color spectrum_color(float t)   // 0 = low, 1 = high
+{
+    static const Color stops[4] = { { 206, 104, 112, 255 }, { 224, 164, 76, 255 }, { 104, 228, 150, 255 }, { 140, 188, 238, 255 } };
+    t = clampf(t, 0, 1) * 3;
+    int i = t >= 3 ? 2 : (int)t;
+    float f = t - i;
+    Color a = stops[i], b = stops[i + 1];
+    return (Color){ (unsigned char)(a.r + (b.r - a.r) * f), (unsigned char)(a.g + (b.g - a.g) * f), (unsigned char)(a.b + (b.b - a.b) * f), 255 };
+}
+
+// Waveform of frames [start, start + span) in r: height = level, colour = brightness.
+static void wave_view(const Sample *s, Rectangle r, double start, double span, float alpha)
+{
+    if (!s->data || s->frames <= 0 || span <= 0) return;
+    int cols = (int)r.width;
+    double fpc = span / cols;
+    float mid = r.y + r.height / 2, h = r.height / 2 - 1;
+    for (int c = 0; c < cols; c++) {
+        double a = start + c * fpc, b = a + fpc;
+        if (b <= 0 || a >= s->frames) continue;
+        if (a < 0) a = 0;
+        if (b > s->frames) b = s->frames;
+        float pk = 0, br = 0, lo = 0, hi = 0;
+        if (fpc >= SUM_BLOCK) {
+            int b0 = (int)(a / SUM_BLOCK), b1 = (int)ceil(b / SUM_BLOCK);
+            float wsum = 0;
+            for (int k = b0; k < b1 && k < s->nsum; k++) {
+                float p = s->pk[k] / 255.0f;
+                pk = fmaxf(pk, p);
+                br += s->br[k] * (p + 0.01f);
+                wsum += p + 0.01f;
+            }
+            br = wsum > 0 ? br / wsum / 255.0f : 0;
+            lo = -pk; hi = pk;
+        } else {
+            int f0 = (int)a, f1 = (int)b;
+            if (f1 <= f0) f1 = f0 + 1;
+            lo = 1; hi = -1;
+            for (int f = f0; f < f1 && f < s->frames; f++) {
+                float x = 0;
+                for (int ch = 0; ch < s->ch; ch++) x += s->data[(size_t)f * s->ch + ch];
+                x /= 32768.0f * s->ch;
+                lo = fminf(lo, x); hi = fmaxf(hi, x);
+            }
+            if (fpc > 4) { pk = fmaxf(fabsf(lo), fabsf(hi)); lo = -pk; hi = pk; }   // envelope
+            int k = f0 / SUM_BLOCK;
+            br = k < s->nsum ? s->br[k] / 255.0f : 0;
+        }
+        float x = r.x + c;
+        float y0 = mid - fmaxf(hi * h, 0.5f), y1 = mid - fminf(lo * h, -0.5f);
+        DrawLineV((Vector2){ x, y0 }, (Vector2){ x, y1 }, fade(spectrum_color(br), alpha));
+    }
+}
+
+// A voice plays frames [pos, end) of a sample.
+typedef struct {
+    const Sample *s;
+    double pos, end, rate, t;
+    float  gain, gl, gr;      // level and constant-power pan gains
+    float  amp, fadeIn, fadeOut;
+    int    state;             // 0 idle, 1 playing, 2 fading out
+} Voice;
+
+static void voice_start(Voice *v, const Sample *s, double start, double end, double rate, float gain, float pan, float fadeSec)
+{
+    float a = (clampf(pan, -1, 1) + 1) * 0.785398f;
+    v->s = s; v->pos = start; v->end = end; v->rate = rate; v->t = 0;
+    v->gain = gain; v->gl = cosf(a) * 1.41421f; v->gr = sinf(a) * 1.41421f;
+    v->fadeIn = fadeSec > 0 ? 1.0f / (fadeSec * SR) : 1.0f;
+    v->fadeOut = fadeSec > 0 ? 1.0f / (fadeSec * SR) : 1.0f / (0.004f * SR);
+    v->amp = fadeSec > 0 ? 0 : 1;
+    v->state = 1;
+}
+
+static void voice_stop(Voice *v, float fadeSec)
+{
+    if (v->state == 1) { v->state = 2; v->fadeOut = 1.0f / (fmaxf(fadeSec, 0.001f) * SR); }
+}
+
+// Add the voice's next frame to L/R. decayTau > 0 shortens the sound.
+static void voice_run(Voice *v, float *L, float *R, float decayTau)
+{
+    if (!v->state) return;
+    const Sample *s = v->s;
+    int i0 = (int)v->pos;
+    if (!s || !s->data || i0 < 0 || i0 + 1 >= s->frames || v->pos >= v->end) { v->state = 0; return; }
+    if (v->state == 1) {
+        v->amp = fminf(v->amp + v->fadeIn, 1);
+        if ((v->end - v->pos) / v->rate <= 1.0f / v->fadeOut) v->state = 2;   // fade into the region's end
+    } else if ((v->amp -= v->fadeOut) <= 0) { v->state = 0; v->amp = 0; return; }
+    float fr = (float)(v->pos - i0), l, r;
+    const short *d = s->data;
+    if (s->ch == 2) {
+        l = (d[2 * i0] * (1 - fr) + d[2 * i0 + 2] * fr) / 32768.0f;
+        r = (d[2 * i0 + 1] * (1 - fr) + d[2 * i0 + 3] * fr) / 32768.0f;
+    } else l = r = (d[i0] * (1 - fr) + d[i0 + 1] * fr) / 32768.0f;
+    float g = v->amp * v->gain * (decayTau > 0 ? expf(-(float)v->t / decayTau) : 1);
+    *L += l * g * v->gl;
+    *R += r * g * v->gr;
+    v->pos += v->rate;
+    v->t += 1.0 / SR;
+}
+
+// ---------------------------------------------------------------------------
+// Drum synthesis — every kit is rendered from the same small set of circuit-
+// style generators (pitch-swept sines, tuned noise, the 808's six square
+// oscillators, inharmonic partials, a chip LFSR), then given its character:
+// sample rate, bit depth, 8-bit companding, saturation, tape and vinyl.
+// ---------------------------------------------------------------------------
+
+enum { BQ_LP, BQ_HP, BQ_BP };
+typedef struct { float b0, b1, b2, a1, a2, z1, z2; } Biquad;
+
+static Biquad bq_make(int type, float f, float q)
+{
+    float w = TAU * clampf(f, 10, SR * 0.45f) / SR, c = cosf(w), al = sinf(w) / (2 * q), a0 = 1 + al;
+    Biquad b = { 0 };
+    if (type == BQ_LP)      { b.b0 = (1 - c) / 2; b.b1 = 1 - c; b.b2 = (1 - c) / 2; }
+    else if (type == BQ_HP) { b.b0 = (1 + c) / 2; b.b1 = -(1 + c); b.b2 = (1 + c) / 2; }
+    else                    { b.b0 = al; b.b1 = 0; b.b2 = -al; }
+    b.b0 /= a0; b.b1 /= a0; b.b2 /= a0;
+    b.a1 = -2 * c / a0; b.a2 = (1 - al) / a0;
+    return b;
+}
+
+static float bq(Biquad *b, float x)
+{
+    float y = b->b0 * x + b->z1;
+    b->z1 = b->b1 * x - b->a1 * y + b->z2;
+    b->z2 = b->b2 * x - b->a2 * y;
+    return y;
+}
+
+static unsigned dr_seed;
+static float dr_noise(void)
+{
+    dr_seed ^= dr_seed << 13; dr_seed ^= dr_seed >> 17; dr_seed ^= dr_seed << 5;
+    return (int)dr_seed * (1.0f / 2147483648.0f);
+}
+static float dr_rand01(void) { return dr_noise() * 0.5f + 0.5f; }
+
+// NES-style noise: a 15-bit LFSR clocked every `period` samples.
+typedef struct { unsigned reg; int cnt; float out; } Lfsr;
+static float lfsr(Lfsr *l, int period, bool shortMode)
+{
+    if (!l->reg) l->reg = 1;
+    if (--l->cnt <= 0) {
+        l->cnt = period;
+        unsigned b = (l->reg ^ (l->reg >> (shortMode ? 6 : 1))) & 1;
+        l->reg = (l->reg >> 1) | (b << 14);
+        l->out = (l->reg & 1) ? 1.0f : -1.0f;
+    }
+    return l->out;
+}
+
+enum { MT_808, MT_NOISE, MT_CHIP };                                   // hats and cymbals
+enum { TM_ANALOG, TM_ACOUSTIC, TM_SIMMONS, TM_CHIP, TM_MALLET };       // toms
+enum { BL_COWBELL, BL_CLAVE, BL_BLOCK, BL_TRIANGLE, BL_CHIP, BL_BAR }; // pad 14
+enum { PC_CONGA, PC_TAMB, PC_GUIRO, PC_BONGO, PC_ZAP, PC_BOWL };       // pad 16
+
+static const char *BELL_NAMES[] = { "COWBELL", "CLAVE", "BLOCK", "TRIANGLE", "BLEEP", "BAR" };
+static const char *PERC_NAMES[] = { "CONGA", "TAMB", "GUIRO", "BONGO", "ZAP", "BOWL" };
+
+typedef struct {
+    const char *name;
+    float kick[2][5];    // start Hz, end Hz, pitch decay, amp decay, click
+    float snare[2][7];   // tone Hz, tone Hz, tone decay, noise decay, noise mix, noise colour Hz, attack
+    float clap[2];       // band Hz, tail
+    float rim[2];        // high Hz, low Hz
+    int   metal;
+    float hat[3];        // closed decay, open decay, high-pass Hz
+    float cym[2];        // crash decay, ride decay
+    int   tomType;
+    float tom[3];        // low tom Hz, pitch drop ratio, decay
+    int   bell, perc;
+    float shaker[3];     // high-pass Hz, attack, decay
+    float lp, rate, drive, crackle, hiss;   // character, 0 = off
+    int   bits, metalBits;
+    bool  mulaw, chip;
+} KitDef;
+
+static const KitDef KITS[] = {
+    { "808",
+      { { 98, 49, 0.035f, 0.42f, 0.25f }, { 125, 56, 0.022f, 0.12f, 0.35f } },
+      { { 185, 330, 0.056f, 0.072f, 0.55f, 9000, 0 }, { 200, 350, 0.04f, 0.11f, 0.72f, 11000, 0 } },
+      { 1050, 0.08f }, { 1700, 455 }, MT_808, { 0.029f, 0.171f, 6300 }, { 0.44f, 0.36f },
+      TM_ANALOG, { 95, 1.18f, 0.16f }, BL_COWBELL, PC_CONGA, { 5000, 0.001f, 0.028f } },
+    { "909",
+      { { 260, 53, 0.032f, 0.18f, 0.7f }, { 300, 60, 0.025f, 0.098f, 0.9f } },
+      { { 190, 345, 0.048f, 0.094f, 0.62f, 12000, 0 }, { 205, 360, 0.036f, 0.132f, 0.78f, 14000, 0 } },
+      { 1200, 0.09f }, { 1850, 500 }, MT_NOISE, { 0.033f, 0.189f, 7500 }, { 0.64f, 0.84f },
+      TM_ANALOG, { 105, 1.35f, 0.14f }, BL_COWBELL, PC_TAMB, { 5500, 0.001f, 0.03f },
+      .drive = 0.15f, .metalBits = 6 },
+    { "707",
+      { { 170, 58, 0.02f, 0.098f, 0.5f }, { 200, 62, 0.015f, 0.068f, 0.6f } },
+      { { 210, 360, 0.04f, 0.077f, 0.65f, 8000, 0 }, { 230, 380, 0.032f, 0.055f, 0.75f, 9000, 0 } },
+      { 1300, 0.06f }, { 1600, 520 }, MT_NOISE, { 0.026f, 0.135f, 7000 }, { 0.4f, 0.72f },
+      TM_ACOUSTIC, { 110, 1.1f, 0.125f }, BL_COWBELL, PC_TAMB, { 6000, 0.002f, 0.035f },
+      .lp = 10000, .rate = 25000, .bits = 8 },
+    { "606",
+      { { 150, 62, 0.015f, 0.083f, 0.2f }, { 175, 68, 0.012f, 0.053f, 0.3f } },
+      { { 220, 400, 0.032f, 0.055f, 0.78f, 10000, 0 }, { 240, 420, 0.028f, 0.077f, 0.85f, 12000, 0 } },
+      { 1150, 0.065f }, { 1900, 600 }, MT_808, { 0.023f, 0.113f, 7500 }, { 0.32f, 0.3f },
+      TM_ANALOG, { 120, 1.12f, 0.1f }, BL_CLAVE, PC_CONGA, { 6500, 0.001f, 0.02f } },
+    { "CR-78",
+      { { 80, 68, 0.02f, 0.064f, 0.05f }, { 95, 75, 0.015f, 0.045f, 0.08f } },
+      { { 240, 450, 0.024f, 0.039f, 0.8f, 7000, 0 }, { 260, 470, 0.02f, 0.055f, 0.85f, 8000, 0 } },
+      { 900, 0.05f }, { 1500, 420 }, MT_808, { 0.019f, 0.09f, 8000 }, { 0.36f, 0.3f },
+      TM_ANALOG, { 140, 1.05f, 0.075f }, BL_CLAVE, PC_GUIRO, { 4500, 0.001f, 0.03f },
+      .lp = 9000, .hiss = 0.15f },
+    { "303 GROOVE",
+      { { 200, 52, 0.03f, 0.225f, 0.6f }, { 140, 48, 0.03f, 0.375f, 0.3f } },
+      { { 195, 340, 0.048f, 0.088f, 0.66f, 11000, 0 }, { 180, 330, 0.056f, 0.066f, 0.55f, 9000, 0 } },
+      { 1150, 0.1f }, { 1750, 470 }, MT_808, { 0.029f, 0.158f, 6800 }, { 0.52f, 0.48f },
+      TM_ANALOG, { 100, 1.25f, 0.15f }, BL_COWBELL, PC_CONGA, { 5500, 0.001f, 0.03f },
+      .lp = 14000, .drive = 0.35f },
+    { "404 DUST",
+      { { 120, 50, 0.03f, 0.188f, 0.4f }, { 160, 56, 0.02f, 0.112f, 0.5f } },
+      { { 200, 330, 0.048f, 0.11f, 0.6f, 6500, 0 }, { 180, 300, 0.056f, 0.099f, 0.5f, 5000, 0.003f } },
+      { 950, 0.11f }, { 1400, 400 }, MT_NOISE, { 0.033f, 0.158f, 6000 }, { 0.64f, 0.72f },
+      TM_ACOUSTIC, { 95, 1.1f, 0.15f }, BL_BLOCK, PC_BONGO, { 4500, 0.008f, 0.06f },
+      .lp = 7000, .rate = 24000, .drive = 0.45f, .hiss = 0.3f, .bits = 12 },
+    { "LM DRUM",
+      { { 110, 58, 0.025f, 0.12f, 0.45f }, { 130, 62, 0.02f, 0.083f, 0.55f } },
+      { { 195, 320, 0.056f, 0.105f, 0.62f, 8500, 0 }, { 215, 350, 0.04f, 0.077f, 0.7f, 9500, 0 } },
+      { 1100, 0.09f }, { 1650, 380 }, MT_NOISE, { 0.039f, 0.225f, 7000 }, { 0.72f, 0.96f },
+      TM_ACOUSTIC, { 90, 1.12f, 0.175f }, BL_COWBELL, PC_CONGA, { 5000, 0.004f, 0.05f },
+      .lp = 11000, .rate = 28000, .bits = 8, .mulaw = true },
+    { "DMX",
+      { { 130, 55, 0.03f, 0.143f, 0.6f }, { 150, 60, 0.02f, 0.09f, 0.7f } },
+      { { 185, 300, 0.064f, 0.11f, 0.58f, 9000, 0 }, { 200, 320, 0.048f, 0.083f, 0.66f, 10000, 0 } },
+      { 1250, 0.085f }, { 1700, 480 }, MT_NOISE, { 0.033f, 0.203f, 7500 }, { 0.8f, 0.9f },
+      TM_ACOUSTIC, { 85, 1.15f, 0.2f }, BL_COWBELL, PC_TAMB, { 5500, 0.003f, 0.045f },
+      .rate = 26000, .drive = 0.2f, .bits = 8, .mulaw = true },
+    { "SDS-V",
+      { { 160, 50, 0.06f, 0.225f, 0.3f }, { 220, 55, 0.08f, 0.165f, 0.4f } },
+      { { 210, 330, 0.08f, 0.121f, 0.55f, 8000, 0 }, { 250, 380, 0.064f, 0.165f, 0.62f, 10000, 0 } },
+      { 1000, 0.1f }, { 1200, 400 }, MT_NOISE, { 0.033f, 0.18f, 7000 }, { 0.72f, 0.78f },
+      TM_SIMMONS, { 75, 2.6f, 0.275f }, BL_BLOCK, PC_ZAP, { 6000, 0.002f, 0.04f },
+      .drive = 0.2f },
+    { "STUDIO",
+      { { 110, 55, 0.02f, 0.15f, 0.55f }, { 95, 50, 0.03f, 0.225f, 0.35f } },
+      { { 200, 340, 0.064f, 0.143f, 0.6f, 9500, 0 }, { 185, 310, 0.08f, 0.176f, 0.55f, 7500, 0 } },
+      { 1100, 0.1f }, { 1250, 420 }, MT_NOISE, { 0.046f, 0.315f, 6500 }, { 1.04f, 1.32f },
+      TM_ACOUSTIC, { 82, 1.08f, 0.225f }, BL_COWBELL, PC_TAMB, { 4000, 0.015f, 0.09f } },
+    { "BRUSHES",
+      { { 90, 52, 0.03f, 0.165f, 0.15f }, { 80, 48, 0.04f, 0.225f, 0.1f } },
+      { { 220, 360, 0.032f, 0.193f, 0.9f, 6000, 0.02f }, { 210, 340, 0.04f, 0.099f, 0.8f, 7000, 0.003f } },
+      { 1500, 0.04f }, { 1300, 450 }, MT_NOISE, { 0.052f, 0.405f, 5500 }, { 1.12f, 1.56f },
+      TM_ACOUSTIC, { 80, 1.05f, 0.25f }, BL_TRIANGLE, PC_BONGO, { 3500, 0.03f, 0.14f },
+      .lp = 9000 },
+    { "TAPE LOFI",
+      { { 115, 52, 0.025f, 0.165f, 0.4f }, { 140, 58, 0.02f, 0.098f, 0.5f } },
+      { { 195, 330, 0.056f, 0.11f, 0.6f, 8000, 0 }, { 205, 345, 0.04f, 0.083f, 0.7f, 9000, 0 } },
+      { 1050, 0.1f }, { 1600, 450 }, MT_NOISE, { 0.033f, 0.203f, 6500 }, { 0.8f, 0.96f },
+      TM_ACOUSTIC, { 88, 1.1f, 0.2f }, BL_BLOCK, PC_CONGA, { 4500, 0.008f, 0.06f },
+      .lp = 5200, .drive = 0.55f, .hiss = 0.5f },
+    { "VINYL",
+      { { 105, 50, 0.03f, 0.18f, 0.35f }, { 130, 55, 0.02f, 0.112f, 0.45f } },
+      { { 190, 320, 0.056f, 0.121f, 0.6f, 7000, 0 }, { 175, 300, 0.064f, 0.099f, 0.55f, 6000, 0.002f } },
+      { 1000, 0.1f }, { 1500, 430 }, MT_NOISE, { 0.033f, 0.18f, 6000 }, { 0.72f, 0.9f },
+      TM_ACOUSTIC, { 85, 1.1f, 0.2f }, BL_COWBELL, PC_TAMB, { 4500, 0.006f, 0.05f },
+      .lp = 6000, .rate = 22050, .drive = 0.3f, .crackle = 1.0f, .hiss = 0.35f, .bits = 12 },
+    { "8-BIT",
+      { { 300, 45, 0.03f, 0.105f, 0 }, { 500, 60, 0.02f, 0.06f, 0 } },
+      { { 220, 440, 0.024f, 0.066f, 0.85f, 12000, 0 }, { 260, 520, 0.016f, 0.044f, 0.9f, 14000, 0 } },
+      { 1500, 0.05f }, { 2000, 700 }, MT_CHIP, { 0.019f, 0.09f, 4000 }, { 0.36f, 0.36f },
+      TM_CHIP, { 110, 2, 0.1f }, BL_CHIP, PC_ZAP, { 6000, 0.001f, 0.03f },
+      .rate = 22050, .bits = 5, .chip = true },
+    { "FELT",
+      { { 70, 46, 0.04f, 0.262f, 0 }, { 85, 52, 0.03f, 0.165f, 0 } },
+      { { 240, 410, 0.04f, 0.165f, 0.55f, 3500, 0.006f }, { 200, 320, 0.064f, 0.22f, 0.45f, 2800, 0.015f } },
+      { 800, 0.15f }, { 900, 300 }, MT_NOISE, { 0.039f, 0.27f, 5000 }, { 1.4f, 1.8f },
+      TM_MALLET, { 110, 1, 0.45f }, BL_BAR, PC_BOWL, { 3000, 0.03f, 0.15f },
+      .lp = 4500 },
+};
+#define N_KITS ((int)(sizeof KITS / sizeof KITS[0]))
+
+static const char *KIT_NAMES[N_KITS];
+static const char *DRUM_PAD[16]  = { "KICK 1", "KICK 2", "SNARE 1", "SNARE 2", "CLAP", "RIM", "CL HAT", "OP HAT",
+                                     "CRASH", "RIDE", "LO TOM", "MID TOM", "HI TOM", NULL, "SHAKER", NULL };
+static const float DRUM_LEN[16]  = { 1.6f, 1.2f, 0.7f, 0.7f, 0.8f, 0.25f, 0.3f, 1.4f, 4.0f, 3.5f, 1.3f, 1.2f, 1.1f, 1.5f, 0.45f, 2.5f };
+static const float DRUM_GAIN[16] = { 1.0f, 0.95f, 0.8f, 0.8f, 0.7f, 0.55f, 0.45f, 0.45f, 0.5f, 0.42f, 0.8f, 0.78f, 0.75f, 0.5f, 0.4f, 0.6f };
+static const float DRUM_PAN[16]  = { 0, 0, 0, 0, 0.05f, -0.1f, 0.25f, 0.3f, -0.3f, 0.35f, -0.35f, 0, 0.35f, -0.2f, 0.4f, -0.4f };
+
+static float env_ad(float t, float atk, float dec) { return (atk > 0 ? fminf(t / atk, 1) : 1) * expf(-t / dec); }
+
+static void dr_kick(const float *k, bool chip, float *y, int n)
+{
+    Biquad hp = bq_make(BQ_HP, 1500, 0.7f);
+    double ph = 0;
+    for (int i = 0; i < n; i++) {
+        float t = i / SR, f = k[1] + (k[0] - k[1]) * expf(-t / k[2]);
+        ph += f / SR;
+        float s = chip ? (fractf((float)ph) < 0.5f ? 0.8f : -0.8f) : sinf(TAU * (float)ph);
+        float c = t < 0.008f ? k[4] * bq(&hp, dr_noise()) * (1 - t / 0.008f) : 0;
+        y[i] = s * env_ad(t, 0.001f, k[3]) + c;
+    }
+}
+
+static void dr_snare(const float *s, bool chip, float *y, int n)
+{
+    Biquad hp = bq_make(BQ_HP, s[5] * 0.15f, 0.7f), lp = bq_make(BQ_LP, s[5], 0.7f);
+    Lfsr lf = { 0 };
+    double p1 = 0, p2 = 0;
+    for (int i = 0; i < n; i++) {
+        float t = i / SR, bend = 1 + 0.2f * expf(-t / 0.008f);
+        p1 += s[0] * bend / SR; p2 += s[1] * bend / SR;
+        float tone = (0.65f * sinf(TAU * (float)p1) + 0.35f * sinf(TAU * (float)p2)) * env_ad(t, 0.0005f, s[2]);
+        float nz = bq(&lp, bq(&hp, chip ? lfsr(&lf, 3, false) : dr_noise()));
+        y[i] = (1 - s[4]) * tone + s[4] * 1.6f * nz * env_ad(t, s[6] > 0 ? s[6] : 0.0005f, s[3]);
+    }
+}
+
+// Several quick noise bursts, then a short room tail.
+static void dr_clap(float band, float tail, float *y, int n)
+{
+    static const float at[4] = { 0, 0.0105f, 0.0195f, 0.031f };
+    Biquad bp = bq_make(BQ_BP, band, 1.6f), bp2 = bq_make(BQ_BP, band * 1.15f, 1.6f);
+    for (int i = 0; i < n; i++) {
+        float t = i / SR, e = 0;
+        for (int k = 0; k < 4; k++) if (t >= at[k]) e = fmaxf(e, expf(-(t - at[k]) / 0.0045f));
+        if (t >= at[3]) e = fmaxf(e, 0.55f * expf(-(t - at[3]) / tail));
+        y[i] = bq(&bp2, bq(&bp, dr_noise())) * e * 4.0f;
+    }
+}
+
+static void dr_rim(float hi, float lo, float *y, int n)
+{
+    Biquad hp = bq_make(BQ_HP, 2000, 0.7f);
+    for (int i = 0; i < n; i++) {
+        float t = i / SR;
+        float x = 0.7f * sinf(TAU * hi * t) * expf(-t / 0.007f) + 0.6f * sinf(TAU * lo * t) * expf(-t / 0.012f)
+                + 0.3f * bq(&hp, dr_noise()) * expf(-t / 0.003f);
+        y[i] = tanhf(3 * x) * 0.7f;
+    }
+}
+
+// The 808's metal: six square oscillators, band-passed.
+static const float M808[6] = { 205.3f, 304.4f, 369.6f, 522.7f, 540.0f, 800.0f };
+
+static void dr_metal808(float dec, float hp, bool cymbal, float *y, int n)
+{
+    double ph[6] = { 0 };
+    Biquad hiBand = bq_make(BQ_BP, 7100, 1.0f), loBand = bq_make(BQ_BP, 3440, 1.2f);
+    Biquad h1 = bq_make(BQ_HP, hp, 0.7f), h2 = bq_make(BQ_HP, hp, 0.7f);
+    for (int i = 0; i < n; i++) {
+        float t = i / SR, x = 0;
+        for (int k = 0; k < 6; k++) { ph[k] += M808[k] / SR; x += fractf((float)ph[k]) < 0.5f ? 1.0f : -1.0f; }
+        x /= 6;
+        float hi = bq(&h2, bq(&h1, bq(&hiBand, x))) * env_ad(t, 0.0005f, dec);
+        float lo = cymbal ? bq(&loBand, x) * 0.6f * env_ad(t, 0.0005f, dec * 0.3f) : 0;
+        y[i] = (hi + lo + (cymbal ? 0.08f * dr_noise() * env_ad(t, 0.001f, dec * 0.7f) : 0)) * 3;
+    }
+}
+
+// Real cymbals: many inharmonic partials plus noise.
+static void dr_metal_noise(float dec, float hp, int np, float lo, float hi, float noiseMix, float atk, float *y, int n)
+{
+    float am[40], cr[40], ci[40], wr[40], wi[40];   // partials as rotating phasors: cheap sines
+    if (np > 40) np = 40;
+    for (int k = 0; k < np; k++) {
+        float f = lo * powf(hi / lo, dr_rand01());
+        am[k] = 0.4f + 0.6f * dr_rand01();
+        cr[k] = 1; ci[k] = 0; wr[k] = cosf(TAU * f / SR); wi[k] = sinf(TAU * f / SR);
+    }
+    Biquad h1 = bq_make(BQ_HP, hp, 0.7f), h2 = bq_make(BQ_HP, hp, 0.7f), lp = bq_make(BQ_LP, hi * 1.1f, 0.7f);
+    for (int i = 0; i < n; i++) {
+        float t = i / SR, x = 0;
+        for (int k = 0; k < np; k++) {
+            x += am[k] * ci[k];
+            float r = cr[k] * wr[k] - ci[k] * wi[k];
+            ci[k] = cr[k] * wi[k] + ci[k] * wr[k];
+            cr[k] = r;
+        }
+        if ((i & 1023) == 1023)
+            for (int k = 0; k < np; k++) { float g = 1 / sqrtf(cr[k] * cr[k] + ci[k] * ci[k]); cr[k] *= g; ci[k] *= g; }
+        x = x * 2.0f / np + noiseMix * bq(&lp, dr_noise());
+        y[i] = bq(&h2, bq(&h1, x)) * env_ad(t, atk, dec) * 1.6f;
+    }
+}
+
+// period: samples per LFSR step; the short mode loops quickly and rings like metal
+static void dr_metal_chip(float dec, int period, bool shortMode, float *y, int n)
+{
+    Lfsr lf = { 0 };
+    for (int i = 0; i < n; i++) {
+        float t = i / SR;
+        y[i] = lfsr(&lf, period, shortMode) * env_ad(t, 0.0005f, dec) * 0.6f;
+    }
+}
+
+static void dr_tom(int type, float f, float drop, float dec, float *y, int n)
+{
+    Biquad hp = bq_make(BQ_HP, 2000, 0.7f), lp = bq_make(BQ_LP, 1200, 0.7f);
+    double ph = 0, ph2 = 0;
+    for (int i = 0; i < n; i++) {
+        float t = i / SR, ft, x;
+        switch (type) {
+        case TM_SIMMONS:   // the electronic "pew": a big pitch sweep plus noise
+            ft = f * (1 + (drop - 1) * expf(-t / 0.12f));
+            ph += ft / SR;
+            x = sinf(TAU * (float)ph) * env_ad(t, 0.001f, dec) + 0.25f * bq(&lp, dr_noise()) * env_ad(t, 0.001f, dec * 0.6f);
+            break;
+        case TM_CHIP:      // a triangle channel sweeping down
+            ft = f * (1 + (drop - 1) * expf(-t / 0.05f));
+            ph += ft / SR;
+            x = (fabsf(4 * fractf((float)ph) - 2) - 1) * env_ad(t, 0.0005f, dec);
+            break;
+        case TM_MALLET:    // a soft mallet on a tuned membrane
+            ph += f / SR; ph2 += f * 2.76f / SR;
+            x = (sinf(TAU * (float)ph) * env_ad(t, 0.004f, dec) + 0.3f * sinf(TAU * (float)ph2) * env_ad(t, 0.004f, dec * 0.25f));
+            break;
+        case TM_ACOUSTIC:  // drum head: fundamental, an inharmonic mode and stick noise
+            ft = f * (1 + (drop - 1) * expf(-t / 0.05f));
+            ph += ft / SR; ph2 += ft * 1.58f / SR;
+            x = sinf(TAU * (float)ph) * env_ad(t, 0.0008f, dec) + 0.35f * sinf(TAU * (float)ph2) * env_ad(t, 0.0008f, dec * 0.4f)
+              + 0.25f * bq(&hp, dr_noise()) * expf(-t / 0.012f);
+            break;
+        default:           // 808-style: a resonator with a little pitch drop and skin noise
+            ft = f * (1 + (drop - 1) * expf(-t / 0.03f));
+            ph += ft / SR;
+            x = sinf(TAU * (float)ph) * env_ad(t, 0.0008f, dec) + 0.08f * bq(&lp, dr_noise()) * expf(-t / (dec * 0.5f));
+        }
+        y[i] = x;
+    }
+}
+
+static void dr_bell(int type, float *y, int n)
+{
+    double p[5] = { 0 };
+    Biquad bp = bq_make(BQ_BP, 1000, 0.8f), hp = bq_make(BQ_HP, 3000, 0.7f);
+    for (int i = 0; i < n; i++) {
+        float t = i / SR, x = 0;
+        switch (type) {
+        case BL_COWBELL:   // the 808 cowbell: squares at 540 and 800 Hz
+            p[0] += 540 / SR; p[1] += 800 / SR;
+            x = (fractf((float)p[0]) < 0.5f ? 1.0f : -1.0f) + (fractf((float)p[1]) < 0.5f ? 1.0f : -1.0f);
+            x = bq(&bp, x * 0.5f) * (0.7f * expf(-t / 0.015f) + 0.3f * expf(-t / 0.25f)) * 2.5f;
+            break;
+        case BL_CLAVE: x = sinf(TAU * 2500 * t) * env_ad(t, 0.0003f, 0.025f); break;
+        case BL_BLOCK:
+            x = (sinf(TAU * 820 * t) * expf(-t / 0.05f) + 0.5f * sinf(TAU * 2100 * t) * expf(-t / 0.02f))
+              + 0.3f * bq(&hp, dr_noise()) * expf(-t / 0.002f);
+            break;
+        case BL_TRIANGLE: {
+            static const float fr[5] = { 2200, 3570, 5100, 6780, 8400 };
+            for (int k = 0; k < 5; k++) x += sinf(TAU * fr[k] * t) / (k + 1.5f);
+            x *= env_ad(t, 0.002f, 1.0f);
+        } break;
+        case BL_CHIP:      // two quick squares, an arpeggio blip
+            p[0] += (t < 0.05f ? 880 : 1320) / SR;
+            x = (fractf((float)p[0]) < 0.5f ? 0.6f : -0.6f) * env_ad(t, 0.0005f, 0.12f);
+            break;
+        default:           // BL_BAR: a marimba-like bar, partials 1 : 3.93
+            x = sinf(TAU * 660 * t) * env_ad(t, 0.002f, 0.6f) + 0.3f * sinf(TAU * 660 * 3.93f * t) * env_ad(t, 0.002f, 0.12f);
+        }
+        y[i] = x;
+    }
+}
+
+static void dr_shaker(const float *s, float *y, int n)
+{
+    Biquad h = bq_make(BQ_HP, s[0], 0.7f), b = bq_make(BQ_BP, s[0] * 1.6f, 0.9f);
+    for (int i = 0; i < n; i++) {
+        float t = i / SR;
+        y[i] = (bq(&h, dr_noise()) + 0.5f * bq(&b, dr_noise())) * env_ad(t, s[1], s[2]);
+    }
+}
+
+static void dr_perc(int type, float *y, int n)
+{
+    Biquad bp = bq_make(BQ_BP, 3200, 2.0f), hp = bq_make(BQ_HP, 5000, 0.7f), slap = bq_make(BQ_HP, 1500, 0.7f);
+    double ph = 0, p2 = 0, p3 = 0;
+    for (int i = 0; i < n; i++) {
+        float t = i / SR, x = 0;
+        switch (type) {
+        case PC_CONGA:     // 808 conga: the tom circuit, tuned high
+            ph += 330 * (1 + 0.06f * expf(-t / 0.02f)) / SR;
+            x = sinf(TAU * (float)ph) * env_ad(t, 0.0008f, 0.16f);
+            break;
+        case PC_BONGO:
+            ph += 420 * (1 + 0.08f * expf(-t / 0.015f)) / SR;
+            x = sinf(TAU * (float)ph) * env_ad(t, 0.0006f, 0.09f) + 0.3f * bq(&slap, dr_noise()) * expf(-t / 0.006f);
+            break;
+        case PC_TAMB: {    // jingles shaken three times
+            static const float at[3] = { 0, 0.028f, 0.065f };
+            float e = 0;
+            for (int k = 0; k < 3; k++) if (t >= at[k]) e = fmaxf(e, (k ? 0.6f : 1.0f) * expf(-(t - at[k]) / 0.07f));
+            x = bq(&hp, dr_noise()) * e * 1.4f;
+        } break;
+        case PC_GUIRO: {   // a scrape: a run of short ticks
+            float k = t / 0.016f;
+            int tick = (int)k;
+            float e = tick < 14 ? expf(-(k - tick) * 6) * (0.6f + 0.4f * sinf(3.14159f * tick / 14)) : 0;
+            x = bq(&bp, dr_noise()) * e * 2.0f;
+        } break;
+        case PC_ZAP:       // a falling square sweep
+            ph += (200 + 1400 * expf(-t / 0.03f)) / SR;
+            x = (fractf((float)ph) < 0.5f ? 0.6f : -0.6f) * env_ad(t, 0.0005f, 0.09f);
+            break;
+        default:           // PC_BOWL: a singing bowl with slow beating
+            ph += 280 / SR; p2 += 280 * 2.71f / SR; p3 += 280.7f / SR;
+            x = (0.5f * sinf(TAU * (float)ph) + 0.5f * sinf(TAU * (float)p3)) * env_ad(t, 0.004f, 2.5f)
+              + 0.4f * sinf(TAU * (float)p2) * env_ad(t, 0.004f, 1.4f);
+        }
+        y[i] = x;
+    }
+}
+
+// The kit's character: saturation, filter, sample rate, bit depth, noise.
+static void dr_character(const KitDef *k, int slot, float *y, int n)
+{
+    float pk = 1e-6f;
+    for (int i = 0; i < n; i++) pk = fmaxf(pk, fabsf(y[i]));
+    for (int i = 0; i < n; i++) y[i] /= pk;
+    if (k->drive > 0) { float g = 1 + k->drive * 5, nm = tanhf(g); for (int i = 0; i < n; i++) y[i] = tanhf(y[i] * g) / nm; }
+    if (k->lp > 0) {
+        Biquad a = bq_make(BQ_LP, k->lp, 0.54f), b = bq_make(BQ_LP, k->lp, 1.31f);   // 4th-order Butterworth
+        for (int i = 0; i < n; i++) y[i] = bq(&b, bq(&a, y[i]));
+    }
+    if (k->rate > 0) {   // sample and hold at the machine's rate
+        float step = k->rate / SR, acc = 1, held = 0;
+        for (int i = 0; i < n; i++) { if ((acc += step) >= 1) { acc -= 1; held = y[i]; } y[i] = held; }
+    }
+    int bits = (slot >= 6 && slot <= 9 && k->metalBits) ? k->metalBits : k->bits;
+    if (bits > 0) {
+        float q = (float)(1 << (bits - 1));
+        for (int i = 0; i < n; i++) {
+            float x = y[i];
+            if (k->mulaw) {   // companded like the 8-bit sample chips of the early 80s
+                float c = copysignf(logf(1 + 255 * fabsf(x)) / logf(256), x);
+                c = roundf(c * q) / q;
+                x = copysignf((powf(256, fabsf(c)) - 1) / 255, c);
+            } else x = roundf(x * q) / q;
+            y[i] = x;
+        }
+    }
+    if (k->hiss > 0 || k->crackle > 0) {
+        float pop = 0;
+        for (int i = 0; i < n; i++) {
+            float fadeOut = 1 - (float)i / n;
+            if (k->crackle > 0 && dr_rand01() < k->crackle * 0.0004f) pop = dr_noise() * 0.6f;
+            y[i] += (k->hiss * 0.04f * dr_noise() + pop) * fadeOut;
+            pop *= 0.82f;
+        }
+    }
+}
+
+typedef struct { Sample s[16]; bool done[16]; volatile bool ready; } Kit;
+static Kit kits[N_KITS];
+
+static void kit_render_slot(int ki, int slot)
+{
+    const KitDef *k = &KITS[ki];
+    {
+        int n = (int)(DRUM_LEN[slot] * SR);
+        float *y = calloc(n, sizeof(float));
+        dr_seed = 0x9e3779b9u * (unsigned)(ki * 16 + slot + 1);
+        switch (slot) {
+        case 0: case 1:  dr_kick(k->kick[slot], k->chip, y, n); break;
+        case 2: case 3:  dr_snare(k->snare[slot - 2], k->chip, y, n); break;
+        case 4:          dr_clap(k->clap[0], k->clap[1], y, n); break;
+        case 5:          dr_rim(k->rim[0], k->rim[1], y, n); break;
+        case 6: case 7: {
+            float dec = k->hat[slot - 6];
+            if (k->metal == MT_808) dr_metal808(dec, k->hat[2], false, y, n);
+            else if (k->metal == MT_CHIP) dr_metal_chip(dec, slot == 7 ? 2 : 1, slot == 6, y, n);
+            else dr_metal_noise(dec, k->hat[2], 24, 3000, 14000, 0.5f, 0.0005f, y, n);
+        } break;
+        case 8: case 9: {
+            float dec = k->cym[slot - 8];
+            if (k->metal == MT_808) dr_metal808(dec, k->hat[2] * (slot == 9 ? 1.1f : 0.8f), slot == 8, y, n);
+            else if (k->metal == MT_CHIP) dr_metal_chip(dec, slot == 8 ? 3 : 2, slot == 9, y, n);
+            else if (slot == 8) dr_metal_noise(dec, 2500, 40, 400, 11000, 0.45f, 0.004f, y, n);
+            else {   // ride: a quieter wash plus the bell's ping
+                dr_metal_noise(dec, 3500, 30, 2500, 12000, 0.25f, 0.001f, y, n);
+                for (int i = 0; i < n; i++) {
+                    float t = i / SR;
+                    y[i] = 0.55f * y[i] + 0.35f * (sinf(TAU * 720 * t) + 0.6f * sinf(TAU * 1730 * t) + 0.4f * sinf(TAU * 2810 * t)) * env_ad(t, 0.0005f, 0.9f);
+                }
+            }
+        } break;
+        case 10: case 11: case 12: {
+            static const float ratio[3] = { 1.0f, 1.42f, 2.0f };
+            dr_tom(k->tomType, k->tom[0] * ratio[slot - 10], k->tom[1], k->tom[2] * (1 - 0.15f * (slot - 10)), y, n);
+        } break;
+        case 13: dr_bell(k->bell, y, n); break;
+        case 14: dr_shaker(k->shaker, y, n); break;
+        default: dr_perc(k->perc, y, n);
+        }
+        dr_character(k, slot, y, n);
+        // level, then trim the silent tail and fade the last few milliseconds
+        float pk = 1e-6f;
+        for (int i = 0; i < n; i++) pk = fmaxf(pk, fabsf(y[i]));
+        int end = n;
+        while (end > 1 && fabsf(y[end - 1]) < pk * 0.0015f) end--;
+        end = end + 480 < n ? end + 480 : n;
+        int fade = end < 480 ? end : 480;
+        for (int i = 0; i < end; i++) {
+            float g = DRUM_GAIN[slot] / pk;
+            if (i > end - fade) g *= (float)(end - i) / fade;
+            y[i] *= g;
+        }
+        sample_from_float(&kits[ki].s[slot], y, end);
+        free(y);
+    }
+    kits[ki].done[slot] = true;
+    bool all = true;
+    for (int i = 0; i < 16; i++) all = all && kits[ki].done[i];
+    kits[ki].ready = all;
+}
+
+// Render pads of kit `ki` for at most `budget` seconds; true once it is complete.
+// A frame never stalls long enough to interrupt the audio.
+static bool kit_work(int ki, double budget)
+{
+    double t0 = GetTime();
+    for (int slot = 0; slot < 16 && !kits[ki].ready; slot++) {
+        if (kits[ki].done[slot]) continue;
+        kit_render_slot(ki, slot);
+        if (GetTime() - t0 > budget) break;
+    }
+    return kits[ki].ready;
+}
+
+static const char *drum_pad_name(int kit, int slot)
+{
+    if (slot == 13) return BELL_NAMES[KITS[kit].bell];
+    if (slot == 15) return PERC_NAMES[KITS[kit].perc];
+    return DRUM_PAD[slot];
+}
+
+// ---------------------------------------------------------------------------
+// DRUMS — 16 pads, each with its own trigger input, playing one of 16 kits
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    int   kit;          // kit the voices play, -1 until rendered
+    Voice v[16];
+    float ptrig[16], glow[16];
+    int   sel;          // pad shown in the waveform
+    float lpL, lpR, hpL, hpR;
+} DrumSt;
+
+static void drums_init(Module *m)
+{
+    DrumSt *s = calloc(1, sizeof(DrumSt));
+    s->kit = -1;
+    m->st = s;
+}
+
+static void drums_hit(Module *m, int pad)
+{
+    DrumSt *s = m->st;
+    if (s->kit < 0) return;
+    const Sample *smp = &kits[s->kit].s[pad];
+    voice_start(&s->v[pad], smp, 0, smp->frames, exp2f(m->p[1] / 12.0f), 1, DRUM_PAN[pad], 0);
+    if (pad == 6) voice_stop(&s->v[7], 0.006f);   // the closed hat chokes the open one
+    s->glow[pad] = 1;
+}
+
+static void drums_process(Module *m)
+{
+    DrumSt *s = m->st;
+    for (int k = 0; k < 16; k++) if (rising(IN(m, k), &s->ptrig[k])) drums_hit(m, k);
+    float L = 0, R = 0, dec = m->p[2];
+    float tau = dec >= 0.999f ? 0 : 0.02f + 2.0f * dec * dec;
+    for (int k = 0; k < 16; k++) voice_run(&s->v[k], &L, &R, tau);
+    float tone = m->p[3];
+    if (tone < -0.01f) {   // darker: low-pass from 18 kHz down to ~700 Hz
+        float a = 1 - expf(-TAU * 18000 * powf(0.04f, -tone) / SR);
+        s->lpL += a * (L - s->lpL); s->lpR += a * (R - s->lpR);
+        L = s->lpL; R = s->lpR;
+    } else if (tone > 0.01f) {   // thinner: high-pass up to ~600 Hz
+        float a = 1 - expf(-TAU * 20 * powf(30, tone) / SR);
+        s->hpL += a * (L - s->hpL); s->hpR += a * (R - s->hpR);
+        L -= s->hpL; R -= s->hpR;
+    }
+    if (m->p[4] > 0.01f) { float g = 1 + m->p[4] * 4, nm = tanhf(g); L = tanhf(L * g) / nm; R = tanhf(R * g) / nm; }
+    m->out[0] = L * m->p[5];
+    m->out[1] = R * m->p[5];
+}
+
+static Color pad_color(int pad)
+{
+    if (pad < 2)  return CABLE_COLORS[1];   // kicks
+    if (pad < 6)  return CABLE_COLORS[0];   // snares, clap, rim
+    if (pad < 8)  return CABLE_COLORS[2];   // hats
+    if (pad < 10) return CABLE_COLORS[3];   // cymbals
+    if (pad < 13) return CABLE_COLORS[4];   // toms
+    return (Color){ 120, 186, 160, 255 };   // percussion
+}
+
+static Rectangle drum_pad(Rectangle a, int i)
+{
+    float w = (a.width - 7 * 4) / 8;
+    return (Rectangle){ a.x + (i % 8) * (w + 4), a.y + 16 + (i / 8) * 34, w, 30 };
+}
+static Rectangle drum_wave(Rectangle a) { return (Rectangle){ a.x, a.y + 86, a.width, a.height - 86 }; }
+
+static void drums_draw(Module *m, Rectangle a)
+{
+    DrumSt *s = m->st;
+    int want = clampi((int)roundf(m->p[0]), 0, N_KITS - 1);
+    if (want != s->kit && kit_work(want, 0.006)) s->kit = want;   // the old kit plays until the new one is ready
+    int kit = s->kit >= 0 ? s->kit : want;
+    txt(want == s->kit ? KITS[want].name : TextFormat("%s  ...", KITS[want].name), a.x, a.y + 2, 10, ACCENT);
+    const Sample *smp = &kits[kit].s[s->sel];
+    const char *info = TextFormat("%s  %.2f S", drum_pad_name(kit, s->sel), smp->frames / SR);
+    txt(info, a.x + a.width - txt_w(info, 10), a.y + 2, 10, TEXT_DIM);
+    for (int i = 0; i < 16; i++) {
+        Rectangle r = drum_pad(a, i);
+        Color c = pad_color(i);
+        float g = s->glow[i];
+        DrawRectangleRec(r, INSET);
+        DrawRectangleRec(r, fade(c, 0.12f + 0.55f * g));
+        DrawRectangleLinesEx(r, 1, i == s->sel ? c : fade(c, 0.35f));
+        txt_c(drum_pad_name(kit, i), r.x + r.width / 2, r.y + 10, 10, g > 0.3f ? TEXT : fade(TEXT, 0.75f));
+        s->glow[i] *= 0.86f;
+    }
+    Rectangle w = drum_wave(a);
+    DrawRectangleRec(w, INSET);
+    Rectangle wi = { w.x + 2, w.y + 2, w.width - 4, w.height - 4 };
+    wave_view(smp, wi, 0, smp->frames, 0.95f);
+    const Voice *v = &s->v[s->sel];
+    if (v->state && v->s == smp) {
+        float x = wi.x + (float)(v->pos / smp->frames) * wi.width;
+        DrawLineEx((Vector2){ x, wi.y }, (Vector2){ x, wi.y + wi.height }, 1, fade(TEXT, 0.7f));
+    }
+}
+
+static bool drums_press(Module *m, Vector2 mp, Rectangle a)
+{
+    DrumSt *s = m->st;
+    for (int i = 0; i < 16; i++)
+        if (CheckCollisionPointRec(mp, drum_pad(a, i))) { s->sel = i; drums_hit(m, i); return true; }
+    if (CheckCollisionPointRec(mp, drum_wave(a))) { drums_hit(m, s->sel); return true; }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// SAMPLER — an audio file with up to 8 markers. PLAY n plays from marker n to
+// the next marker (or the end), STOP n stops it. Wheel zooms, drag scrolls.
+// ---------------------------------------------------------------------------
+
+#define SMP_MARKS       8
+#define SAMPLER_MAX_SEC 600
+#define DRAG_VIEW       100
+#define DRAG_OVER       101
+
+typedef struct {
+    Sample smp, next, old;             // next / old: hand-over with the audio thread
+    volatile int swap;
+    int    nmark, mark[SMP_MARKS];     // frame positions, ascending
+    double vs, vw;                     // visible frames [vs, vs + vw)
+    Voice  v[SMP_MARKS];
+    float  pplay[SMP_MARKS], pstop[SMP_MARKS];
+    int    drag;
+    float  dragX;
+    double dragVs, lastClick;
+    char   name[48];
+    unsigned id;
+    volatile bool dirty;
+    double savedT;
+} SamplerSt;
+
+static const char *SMP_BTN[2] = { "LOAD", "AUTO" };
+static const char *VOICE_LABELS[2] = { "POLY", "MONO" };
+
+static void sampler_init(Module *m)
+{
+    SamplerSt *s = calloc(1, sizeof(SamplerSt));
+    s->id = new_id();
+    s->drag = -1;
+    m->st = s;
+}
+
+static void sampler_fini(Module *m)
+{
+    SamplerSt *s = m->st;
+    if (!s) return;
+    sample_free(&s->smp); sample_free(&s->next); sample_free(&s->old);
+}
+
+static int sampler_end(const SamplerSt *s, int i) { return i + 1 < s->nmark ? s->mark[i + 1] : s->smp.frames; }
+
+static void sampler_swap(SamplerSt *s)
+{
+    for (int i = 0; i < SMP_MARKS; i++) s->v[i].state = 0;
+    s->old = s->smp;
+    s->smp = s->next;
+    memset(&s->next, 0, sizeof s->next);
+    s->swap = 0;
+}
+
+static void sampler_play(Module *m, int i)
+{
+    SamplerSt *s = m->st;
+    if (i >= s->nmark || !s->smp.data) return;
+    float fade = m->p[1];
+    if ((int)roundf(m->p[2]) == 1)   // MONO: one region at a time
+        for (int k = 0; k < SMP_MARKS; k++) if (k != i) voice_stop(&s->v[k], fade);
+    voice_start(&s->v[i], &s->smp, s->mark[i], sampler_end(s, i), exp2f(m->p[0] / 12.0f), 1, 0, fade);
+}
+
+static void sampler_process(Module *m)
+{
+    SamplerSt *s = m->st;
+    if (s->swap) sampler_swap(s);
+    for (int i = 0; i < SMP_MARKS; i++) {
+        if (rising(IN(m, i), &s->pplay[i])) sampler_play(m, i);
+        if (rising(IN(m, SMP_MARKS + i), &s->pstop[i])) voice_stop(&s->v[i], m->p[1]);
+    }
+    float rate = exp2f(m->p[0] / 12.0f + IN(m, 16)), L = 0, R = 0;
+    for (int i = 0; i < SMP_MARKS; i++) { s->v[i].rate = rate; voice_run(&s->v[i], &L, &R, 0); }
+    m->out[0] = L * m->p[3];
+    m->out[1] = R * m->p[3];
+}
+
+// Read an audio file (UI thread). keep: restore a project, leaving markers and view alone.
+static bool sampler_read(Module *m, const char *path, bool keep)
+{
+    SamplerSt *s = m->st;
+    if (s->swap) return false;
+    Wave w = LoadWave(path);
+    if (!w.data || !w.frameCount) return false;
+    int ch = w.channels >= 2 ? 2 : 1;
+    WaveFormat(&w, (int)SR, 16, ch);
+    int n = (int)w.frameCount;
+    if (n > SAMPLER_MAX_SEC * (int)SR) n = SAMPLER_MAX_SEC * (int)SR;
+    Sample nx = { .ch = ch, .frames = n, .data = malloc((size_t)n * ch * sizeof(short)) };
+    memcpy(nx.data, w.data, (size_t)n * ch * sizeof(short));
+    UnloadWave(w);
+    sample_summarize(&nx);
+    s->next = nx;
+    s->swap = 1;
+    if (UI_OWNS_AUDIO) sampler_swap(s);
+    if (!keep) {
+        s->nmark = 1; s->mark[0] = 0;
+        s->vs = 0; s->vw = n;
+    }
+    for (int i = 0; i < s->nmark; i++) s->mark[i] = clampi(s->mark[i], 0, n - 1);
+    if (s->vw <= 0 || s->vs + s->vw > n) { s->vs = 0; s->vw = n; }
+    return true;
+}
+
+static bool sampler_load(Module *m, const char *path)
+{
+    SamplerSt *s = m->st;
+    if (!sampler_read(m, path, false)) { toast(TextFormat("CANNOT READ %s", GetFileName(path))); return false; }
+    snprintf(s->name, sizeof s->name, "%s", GetFileName(path));
+    s->dirty = true;
+    toast(TextFormat("LOADED %s (%.1f S)", GetFileName(path), s->next.data ? s->next.frames / SR : s->smp.frames / SR));
+    return true;
+}
+
+// Markers at the 8 strongest onsets (sudden rises in level).
+static void sampler_auto(SamplerSt *s)
+{
+    const Sample *p = &s->smp;
+    if (!p->nsum) return;
+    float *o = calloc(p->nsum, sizeof(float));
+    for (int b = 1; b < p->nsum; b++) {
+        float prev = 0;
+        for (int k = b - 4 < 0 ? 0 : b - 4; k < b; k++) prev = fmaxf(prev, p->pk[k]);
+        o[b] = fmaxf(0, p->pk[b] - prev * 1.05f);
+    }
+    int gap = (int)(0.12f * SR / SUM_BLOCK), first = 0;
+    while (first < p->nsum && p->pk[first] < 8) first++;
+    s->nmark = 1;
+    s->mark[0] = (first < p->nsum ? first : 0) * SUM_BLOCK;
+    for (int b = first - gap; b < first + gap; b++) if (b >= 0 && b < p->nsum) o[b] = 0;
+    while (s->nmark < SMP_MARKS) {
+        int best = -1;
+        for (int b = 0; b < p->nsum; b++) if (o[b] > 2 && (best < 0 || o[b] > o[best])) best = b;
+        if (best < 0) break;
+        s->mark[s->nmark++] = best * SUM_BLOCK;
+        for (int b = best - gap; b < best + gap; b++) if (b >= 0 && b < p->nsum) o[b] = 0;
+    }
+    free(o);
+    for (int i = 1; i < s->nmark; i++)
+        for (int j = i; j > 0 && s->mark[j] < s->mark[j - 1]; j--) { int t = s->mark[j]; s->mark[j] = s->mark[j - 1]; s->mark[j - 1] = t; }
+}
+
+static Rectangle smp_lane(Rectangle a) { return (Rectangle){ a.x, a.y, a.width, 16 }; }
+static Rectangle smp_wave(Rectangle a) { return (Rectangle){ a.x, a.y + 16, a.width, a.height - 64 }; }
+static Rectangle smp_over(Rectangle a) { return (Rectangle){ a.x, a.y + a.height - 44, a.width, 12 }; }
+static Rectangle smp_btn(Rectangle a, int i)   // LOAD, AUTO, then pads 1..8
+{
+    float w = (a.width - 9 * 4) / 10;
+    return (Rectangle){ a.x + i * (w + 4), a.y + a.height - 24, w, 24 };
+}
+
+static double smp_frame_at(const SamplerSt *s, Rectangle r, float x) { return s->vs + (x - r.x) / r.width * s->vw; }
+static float  smp_x_of(const SamplerSt *s, Rectangle r, double f)    { return r.x + (float)((f - s->vs) / s->vw) * r.width; }
+
+static void smp_clamp_view(SamplerSt *s)
+{
+    if (!s->smp.data || s->swap) return;   // a new file is on its way: keep its view
+    double n = s->smp.frames;
+    if (s->vw > n) s->vw = n;
+    if (s->vw < 64) s->vw = 64 < n ? 64 : n;
+    if (s->vs < 0) s->vs = 0;
+    if (s->vs + s->vw > n) s->vs = n - s->vw;
+}
+
+static int smp_marker_at(const SamplerSt *s, Rectangle lane, float x)
+{
+    for (int i = 0; i < s->nmark; i++) if (fabsf(smp_x_of(s, lane, s->mark[i]) - x) < 7) return i;
+    return -1;
+}
+
+static void sampler_draw(Module *m, Rectangle a)
+{
+    SamplerSt *s = m->st;
+    if (s->swap && UI_OWNS_AUDIO) sampler_swap(s);
+    if (!s->swap && s->old.data) sample_free(&s->old);
+    smp_clamp_view(s);
+    Rectangle lane = smp_lane(a), wv = smp_wave(a), ov = smp_over(a);
+    DrawRectangleRec((Rectangle){ a.x, a.y, a.width, wv.y + wv.height - a.y }, INSET);
+    DrawRectangleRec(ov, INSET);
+    const Sample *p = &s->smp;
+    if (!p->data) {
+        txt_c("LOAD OR DROP AN AUDIO FILE  (WAV, MP3, OGG, FLAC)", wv.x + wv.width / 2, wv.y + wv.height / 2 - 5, 10, TEXT_DIM);
+    } else {
+        BeginScissorMode((int)wv.x, (int)lane.y, (int)wv.width, (int)(wv.y + wv.height - lane.y));
+        for (int i = 0; i < s->nmark; i++) {   // regions, tinted by marker
+            float x0 = smp_x_of(s, wv, s->mark[i]), x1 = smp_x_of(s, wv, sampler_end(s, i));
+            DrawRectangleRec((Rectangle){ x0, wv.y, x1 - x0, wv.height }, fade(CABLE_COLORS[i % N_CABLE_COLORS], 0.07f));
+        }
+        wave_view(p, (Rectangle){ wv.x, wv.y + 2, wv.width, wv.height - 4 }, s->vs, s->vw, 0.95f);
+        for (int i = 0; i < s->nmark; i++) {
+            float x = smp_x_of(s, wv, s->mark[i]);
+            Color c = CABLE_COLORS[i % N_CABLE_COLORS];
+            DrawLineEx((Vector2){ x, lane.y }, (Vector2){ x, wv.y + wv.height }, 1, fade(c, 0.8f));
+            DrawRectangleRec((Rectangle){ x, lane.y + 1, 14, 13 }, c);
+            txt(TextFormat("%d", i + 1), x + 4, lane.y + 3, 10, INSET);
+        }
+        for (int i = 0; i < SMP_MARKS; i++)
+            if (s->v[i].state) {
+                float x = smp_x_of(s, wv, s->v[i].pos);
+                DrawLineEx((Vector2){ x, wv.y }, (Vector2){ x, wv.y + wv.height }, 1.5f, TEXT);
+            }
+        EndScissorMode();
+        char nm[48];
+        snprintf(nm, sizeof nm, "%s", s->name);
+        for (int n = (int)strlen(nm); n > 3 && txt_w(nm, 10) > wv.width * 0.5f; n--) strcpy(nm + n - 4, "...");
+        txt(nm, wv.x + 6, wv.y + 4, 10, fade(TEXT_DIM, 0.9f));
+        const char *t = TextFormat("%.2f - %.2f / %.1f S", s->vs / SR, (s->vs + s->vw) / SR, p->frames / SR);
+        txt(t, wv.x + wv.width - 6 - txt_w(t, 10), wv.y + 4, 10, fade(TEXT_DIM, 0.9f));
+        // overview of the whole file with the visible window
+        wave_view(p, ov, 0, p->frames, 0.5f);
+        float x0 = ov.x + (float)(s->vs / p->frames) * ov.width, x1 = ov.x + (float)((s->vs + s->vw) / p->frames) * ov.width;
+        DrawRectangleLinesEx((Rectangle){ x0, ov.y, fmaxf(x1 - x0, 2), ov.height }, 1, fade(TEXT, 0.6f));
+    }
+    for (int i = 0; i < 10; i++) {
+        Rectangle b = smp_btn(a, i);
+        bool hov = CheckCollisionPointRec(GetMousePosition(), b);
+        if (i < 2) {
+            DrawRectangleRec(b, hov ? PANEL_HI : INSET);
+            DrawRectangleLinesEx(b, 1, PANEL_HI);
+            txt_c(SMP_BTN[i], b.x + b.width / 2, b.y + 7, 10, hov ? TEXT : TEXT_DIM);
+            continue;
+        }
+        int k = i - 2;
+        bool has = k < s->nmark, on = s->v[k].state != 0;
+        Color c = CABLE_COLORS[k % N_CABLE_COLORS];
+        DrawRectangleRec(b, on ? fade(c, 0.5f) : (has ? fade(c, 0.12f) : INSET));
+        DrawRectangleLinesEx(b, 1, has ? fade(c, 0.6f) : PANEL_HI);
+        txt_c(TextFormat("%d", k + 1), b.x + b.width / 2, b.y + 7, 10, has ? TEXT : fade(TEXT_DIM, 0.5f));
+    }
+}
+
+static bool sampler_press(Module *m, Vector2 mp, Rectangle a)
+{
+    SamplerSt *s = m->st;
+    Rectangle lane = smp_lane(a), wv = smp_wave(a), ov = smp_over(a);
+    s->drag = -1;
+    for (int i = 0; i < 10; i++) {
+        if (!CheckCollisionPointRec(mp, smp_btn(a, i))) continue;
+        if (i == 0) {
+#if defined(PLATFORM_WEB)
+            g_pickTarget = (int)(m - mods);
+            emscripten_run_script("rayaPickFile()");
+#else
+            toast("DROP AN AUDIO FILE ONTO THE SAMPLER TO LOAD IT");
+#endif
+        } else if (i == 1) sampler_auto(s);
+        else sampler_play(m, i - 2);
+        return true;
+    }
+    if (!s->smp.data) return CheckCollisionPointRec(mp, a);
+    if (CheckCollisionPointRec(mp, lane)) {
+        int k = smp_marker_at(s, lane, mp.x);
+        if (k < 0 && s->nmark < SMP_MARKS) {   // a new marker
+            s->mark[s->nmark] = clampi((int)smp_frame_at(s, lane, mp.x), 0, s->smp.frames - 1);
+            k = s->nmark++;
+            for (; k > 0 && s->mark[k] < s->mark[k - 1]; k--) { int t = s->mark[k]; s->mark[k] = s->mark[k - 1]; s->mark[k - 1] = t; }
+        }
+        s->drag = k;
+        return true;
+    }
+    if (CheckCollisionPointRec(mp, wv)) {
+        double now = GetTime();
+        if (now - s->lastClick < 0.3) { s->vs = 0; s->vw = s->smp.frames; }   // double-click: whole file
+        s->lastClick = now;
+        s->drag = DRAG_VIEW; s->dragX = mp.x; s->dragVs = s->vs;
+        return true;
+    }
+    if (CheckCollisionPointRec(mp, ov)) {
+        s->drag = DRAG_OVER;
+        s->vs = (mp.x - ov.x) / ov.width * s->smp.frames - s->vw / 2;
+        smp_clamp_view(s);
+        return true;
+    }
+    return CheckCollisionPointRec(mp, a);
+}
+
+static void sampler_drag(Module *m, Vector2 mp, Rectangle a)
+{
+    SamplerSt *s = m->st;
+    Rectangle wv = smp_wave(a), ov = smp_over(a);
+    if (s->drag >= 0 && s->drag < s->nmark) {   // move a marker, keeping them in order
+        int k = s->drag;
+        s->mark[k] = clampi((int)smp_frame_at(s, wv, mp.x), 0, s->smp.frames - 1);
+        for (; k > 0 && s->mark[k] < s->mark[k - 1]; k--) { int t = s->mark[k]; s->mark[k] = s->mark[k - 1]; s->mark[k - 1] = t; }
+        for (; k + 1 < s->nmark && s->mark[k] > s->mark[k + 1]; k++) { int t = s->mark[k]; s->mark[k] = s->mark[k + 1]; s->mark[k + 1] = t; }
+        s->drag = k;
+    } else if (s->drag == DRAG_VIEW) {
+        s->vs = s->dragVs - (mp.x - s->dragX) / wv.width * s->vw;
+    } else if (s->drag == DRAG_OVER) {
+        s->vs = (mp.x - ov.x) / ov.width * s->smp.frames - s->vw / 2;
+    }
+    smp_clamp_view(s);
+}
+
+static bool sampler_wheel(Module *m, Vector2 mp, Rectangle a, float wheel)
+{
+    SamplerSt *s = m->st;
+    Rectangle wv = smp_wave(a);
+    if (!s->smp.data || mp.y < a.y || mp.y > wv.y + wv.height) return false;
+    double f = smp_frame_at(s, wv, mp.x);
+    s->vw *= pow(0.8, wheel);
+    smp_clamp_view(s);
+    s->vs = f - (mp.x - wv.x) / wv.width * s->vw;
+    smp_clamp_view(s);
+    return true;
+}
+
+static bool sampler_rpress(Module *m, Vector2 mp, Rectangle a)   // right-click a marker: remove it
+{
+    SamplerSt *s = m->st;
+    Rectangle lane = smp_lane(a);
+    if (!CheckCollisionPointRec(mp, (Rectangle){ lane.x, lane.y, lane.width, smp_wave(a).y + smp_wave(a).height - lane.y })) return false;
+    int k = smp_marker_at(s, lane, mp.x);
+    if (k < 0) return false;
+    for (int i = 0; i < SMP_MARKS; i++) s->v[i].state = 0;
+    for (int i = k; i + 1 < s->nmark; i++) s->mark[i] = s->mark[i + 1];
+    s->nmark--;
+    return true;
+}
+
+// data line: id view-start view-width markers... name
+static void sampler_save(const Module *m, char *out, int cap)
+{
+    const SamplerSt *s = m->st;
+    int n = snprintf(out, cap, "%u %.0f %.0f %d", s->id, s->vs, s->vw, s->nmark);
+    for (int i = 0; i < s->nmark && n < cap; i++) n += snprintf(out + n, cap - n, " %d", s->mark[i]);
+    if (n < cap) snprintf(out + n, cap - n, " %s", s->name);
+}
+
+static void sampler_load_data(Module *m, const char *str)
+{
+    SamplerSt *s = m->st;
+    int used = 0, nm = 0;
+    if (sscanf(str, "%u %lf %lf %d%n", &s->id, &s->vs, &s->vw, &nm, &used) < 4) return;
+    str += used;
+    s->nmark = 0;
+    for (int i = 0; i < nm && i < SMP_MARKS; i++) {
+        if (sscanf(str, " %d%n", &s->mark[i], &used) != 1) break;
+        str += used;
+        s->nmark++;
+    }
+    while (*str == ' ') str++;
+    snprintf(s->name, sizeof s->name, "%s", str);
+}
+
+static unsigned *sampler_audio_id(Module *m) { return &((SamplerSt *)m->st)->id; }
+
+static bool sampler_audio_save(Module *m, const char *path, int how)
+{
+    SamplerSt *s = m->st;
+    if (!s->smp.data || (how != SAVE_ALL && !s->dirty)) return false;
+    s->dirty = false;
+    return write_wav(path, s->smp.data, s->smp.frames, s->smp.ch);
+}
+
+static void sampler_audio_load(Module *m, const char *path)
+{
+    sampler_read(m, path, true);
+    ((SamplerSt *)m->st)->dirty = false;
+}
+
+// ---------------------------------------------------------------------------
 // Module registry
 // ---------------------------------------------------------------------------
 
@@ -1597,7 +2808,8 @@ static const ModDef DEFS[M_COUNT] = {
         { { "TIME", 0.1f, TAPE_MAX_SEC, 6, K_EXP, F_SEC },  { "SPEED", -2, 2, 1, K_KNOB, F_NUM },
           { "FEEDBACK", 0, 1, 0.6f, K_KNOB, F_PCT },        { "WOW", 0, 1, 0.3f, K_KNOB, F_PCT },
           { "MIX", 0, 1, 0.5f, K_KNOB, F_PCT },             { "LEVEL", 0, 1, 0.8f, K_KNOB, F_PCT } },
-        tape_init, tape_process, tape_draw, tape_press, tape_drag, tape_save, tape_load_data, tape_fini },
+        tape_init, tape_process, tape_draw, tape_press, tape_drag, tape_save, tape_load_data, tape_fini,
+        tape_audio_id, tape_audio_save, tape_audio_load },
     [M_ARP] = { "ARPEGGIATOR", 412, 56, 6, 2, 6, { "N1", "N2", "N3", "N4", "CLOCK", "RESET" }, { "NOTE", "GATE" },
         { { "MODE", 0, ARP_NMODES - 1, ARP_UPDOWN, K_STEP, F_LABEL, ARP_MODES }, { "OCTAVES", 1, 4, 2, K_STEP, F_INT },
           { "DIVIDE", 1, 8, 1, K_STEP, F_INT },   { "GATE", 0.05f, 1, 0.5f, K_KNOB, F_PCT },
@@ -1609,13 +2821,30 @@ static const ModDef DEFS[M_COUNT] = {
           { "VARY", 0, 1, 0.2f, K_KNOB, F_PCT },             { "GATE", 0.1f, 1, 0.85f, K_KNOB, F_PCT },
           { "OCTAVE", -2, 2, 0, K_STEP, F_OCT } },
         perf_init, perf_process, perf_draw, NULL, NULL },
+    [M_DRUMS] = { .name = "DRUMS", .w = 600, .customH = 142, .nin = 16, .nout = 2, .nknob = 6,
+        .ins = { "BD1", "BD2", "SD1", "SD2", "CP", "RS", "CH", "OH", "CY", "RD", "LT", "MT", "HT", "BL", "SH", "PC" },
+        .outs = { "L", "R" },
+        .knobs = { { "KIT", 0, N_KITS - 1, 0, K_STEP, F_LABEL, KIT_NAMES }, { "TUNE", -12, 12, 0, K_STEP, F_SEMI },
+                   { "DECAY", 0.05f, 1, 1, K_KNOB, F_PCT },  { "TONE", -1, 1, 0, K_KNOB, F_NUM },
+                   { "DRIVE", 0, 1, 0, K_KNOB, F_PCT },       { "LEVEL", 0, 1, 0.8f, K_KNOB, F_PCT } },
+        .init = drums_init, .process = drums_process, .draw = drums_draw, .press = drums_press },
+    [M_SAMPLER] = { .name = "SAMPLER", .w = 600, .customH = 170, .nin = 17, .nout = 2, .nknob = 4,
+        .ins = { "PLAY1", "PLAY2", "PLAY3", "PLAY4", "PLAY5", "PLAY6", "PLAY7", "PLAY8",
+                 "STOP1", "STOP2", "STOP3", "STOP4", "STOP5", "STOP6", "STOP7", "STOP8", "PITCH" },
+        .outs = { "L", "R" },
+        .knobs = { { "PITCH", -24, 24, 0, K_STEP, F_SEMI }, { "FADE", 0.001f, 0.25f, 0.005f, K_EXP, F_SEC },
+                   { "VOICES", 0, 1, 0, K_SEG, F_INT, VOICE_LABELS }, { "LEVEL", 0, 1, 0.8f, K_KNOB, F_PCT } },
+        .init = sampler_init, .process = sampler_process, .draw = sampler_draw, .press = sampler_press, .drag = sampler_drag,
+        .save = sampler_save, .load = sampler_load_data, .fini = sampler_fini,
+        .audio_id = sampler_audio_id, .audio_save = sampler_audio_save, .audio_load = sampler_audio_load,
+        .wheel = sampler_wheel, .rpress = sampler_rpress },
 };
 
 // Stable ids used in preset files.
 static const char *MOD_ID[M_COUNT] = {
     [M_CLOCK] = "clock", [M_SEQ] = "seq", [M_CHORD] = "chords", [M_OSC3] = "osc3",
     [M_LFO] = "lfo", [M_REVERB] = "reverb", [M_OUT] = "output", [M_TAPE] = "tape",
-    [M_ARP] = "arp", [M_PERF] = "performer",
+    [M_ARP] = "arp", [M_PERF] = "performer", [M_DRUMS] = "drums", [M_SAMPLER] = "sampler",
 };
 
 // ---------------------------------------------------------------------------
@@ -1627,7 +2856,6 @@ static const char *MOD_ID[M_COUNT] = {
 // growing the recording buffer in place.
 #define REC_MAX_SEC (20 * 60)
 
-static volatile bool g_running = true;
 static volatile bool g_recording;
 static short *g_rec;
 static int    g_recLen, g_recCap;
@@ -2061,7 +3289,7 @@ static int preset_instantiate(const char *text, Vector2 at, bool keepIds)
     }
     if (!keepIds)
         for (int i = 0; i < MAX_MODULES; i++)
-            if (sel[i] && mods[i].type == M_TAPE) ((TapeSt *)mods[i].st)->id = new_id();
+            if (sel[i] && DEFS[mods[i].type].audio_id) *DEFS[mods[i].type].audio_id(&mods[i]) = new_id();
     rebuild_routing();
     return added;
 }
@@ -2312,6 +3540,29 @@ static const struct { const char *name, *body; } FACTORY[] = {
       "cable 0 0 1 0 3\ncable 1 0 3 0 2\ncable 1 0 3 1 2\ncable 1 0 3 2 2\ncable 1 1 3 3 3\n"
       "cable 3 0 4 0 4\ncable 3 1 4 1 4\ncable 4 0 5 0 0\ncable 4 1 5 1 0\n"
       "cable 2 0 5 0 1\ncable 2 1 5 1 1\ncable 5 0 6 0 0\ncable 5 1 6 1 0\n" },
+    { "808 groove",
+      "module clock 0 0\nknob BPM 84\n"
+      "module seq 256 0\nknob CHANCE 1\nknob GLIDE 0\ndata 1:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500\n"
+      "module seq 668 0\nknob CHANCE 1\nknob GLIDE 0\ndata 0:0.500 0:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500\n"
+      "module seq 1080 0\nknob CHANCE 0.85\nknob GLIDE 0\ndata 1:0.500 0:0.300 1:0.700 0:0.300 1:0.500 0:0.300 1:0.800 0:0.300 1:0.500 0:0.300 1:0.700 0:0.300 1:0.500 0:0.300 1:0.900 0:0.300\n"
+      "module drums 0 300\nknob KIT 0\n"
+      "module reverb 624 300\nknob SIZE 1.2\nknob DECAY 6\nknob MIX 0.22\n"
+      "module output 884 300\n"
+      "cable 0 0 1 0 3\ncable 0 0 2 0 3\ncable 0 0 3 0 3\n"
+      "cable 1 0 4 0 1\ncable 2 0 4 2 0\ncable 3 0 4 6 2\n"
+      "cable 4 0 5 0 4\ncable 4 1 5 1 4\ncable 5 0 6 0 0\ncable 5 1 6 1 0\n" },
+    { "dusty vinyl beat",
+      "module clock 0 0\nknob BPM 76\n"
+      "module seq 256 0\nknob CHANCE 1\nknob GLIDE 0\ndata 1:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500\n"
+      "module seq 668 0\nknob CHANCE 1\nknob GLIDE 0\ndata 0:0.500 0:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500\n"
+      "module seq 1080 0\nknob CHANCE 0.75\nknob GLIDE 0\ndata 1:0.500 0:0.300 1:0.700 0:0.300 1:0.500 0:0.300 1:0.800 0:0.300 1:0.500 0:0.300 1:0.700 0:0.300 1:0.500 0:0.300 1:0.900 0:0.300\n"
+      "module drums 0 300\nknob KIT 13\nknob TONE -0.15\n"
+      "module tape 624 300\nknob TIME 0.789\nknob FEEDBACK 0.45\nknob WOW 0.5\nknob MIX 0.3\ndata 1 1\n"
+      "module reverb 1060 300\nknob SIZE 1.1\nknob DECAY 5\nknob MIX 0.25\n"
+      "module output 1320 300\n"
+      "cable 0 0 1 0 3\ncable 0 0 2 0 3\ncable 0 0 3 0 3\n"
+      "cable 1 0 4 0 1\ncable 2 0 4 2 0\ncable 3 0 4 6 2\n"
+      "cable 4 0 5 0 4\ncable 4 1 5 1 4\ncable 5 0 6 0 0\ncable 5 1 6 1 0\ncable 6 0 7 0 0\ncable 6 1 7 1 0\n" },
 };
 #define N_FACTORY ((int)(sizeof FACTORY / sizeof FACTORY[0]))
 
@@ -2415,29 +3666,23 @@ static void proj_set_current(void)
     write_file(PRESET_ROOT "/current", proj_slug);
 }
 
-// Store tape audio that changed. Big tapes are written less often while they
-// keep recording; `force` writes every changed tape now.
-static bool proj_save_tapes(bool force)
+// Store the audio of tapes and samplers that changed.
+static bool proj_save_audio(int how)
 {
     bool wrote = false;
-    double now = GetTime();
     for (int i = 0; i < MAX_MODULES; i++) {
         Module *m = &mods[i];
-        if (!m->alive || m->type != M_TAPE) continue;
-        TapeSt *s = m->st;
-        int L = tape_len(m);
-        if (!s->dirty || !s->buf || (!force && now - s->savedT < 20 + L / SR * 0.5)) continue;
+        const ModDef *d = &DEFS[m->type];
+        if (!m->alive || !d->audio_save) continue;
         char path[256];
-        proj_file(path, sizeof path, proj_slug, TextFormat("tape-%u.wav", s->id));
-        s->dirty = false;
-        s->savedT = now;
-        if (write_wav(path, s->buf, L)) wrote = true;
+        proj_file(path, sizeof path, proj_slug, TextFormat("audio-%u.wav", *d->audio_id(m)));
+        if (d->audio_save(m, path, how)) wrote = true;
     }
     return wrote;
 }
 
-// Remove stored tape audio that no tape in the patch refers to any more.
-static void proj_prune_tapes(void)
+// Remove stored audio that no module in the patch refers to any more.
+static void proj_prune_audio(void)
 {
     char dir[256];
     snprintf(dir, sizeof dir, "%s/%s", PROJECT_DIR, proj_slug);
@@ -2446,10 +3691,10 @@ static void proj_prune_tapes(void)
     struct dirent *e;
     while ((e = readdir(d))) {
         unsigned id;
-        if (sscanf(e->d_name, "tape-%u.wav", &id) != 1) continue;
+        if (sscanf(e->d_name, "audio-%u.wav", &id) != 1 && sscanf(e->d_name, "tape-%u.wav", &id) != 1) continue;
         bool used = false;
         for (int i = 0; i < MAX_MODULES && !used; i++)
-            used = mods[i].alive && mods[i].type == M_TAPE && ((TapeSt *)mods[i].st)->id == id;
+            used = mods[i].alive && DEFS[mods[i].type].audio_id && *DEFS[mods[i].type].audio_id(&mods[i]) == id;
         if (!used) remove(TextFormat("%s/%s", dir, e->d_name));
     }
     closedir(d);
@@ -2471,8 +3716,8 @@ static void project_save(bool force)
         text = NULL;
     }
     free(text);
-    if (proj_save_tapes(force)) wrote = true;
-    if (changed) proj_prune_tapes();
+    if (proj_save_audio(force ? SAVE_NOW : SAVE_LATER)) wrote = true;
+    if (changed) proj_prune_audio();
     if (wrote) fs_sync();
 }
 
@@ -2508,14 +3753,14 @@ static bool project_open(const char *slug)
         if (!strncmp(line, "name ", 5)) snprintf(proj_name, sizeof proj_name, "%s", line + 5);
         else sscanf(line, "pan %f %f", &pan.x, &pan.y);
     }
-    for (int i = 0; i < MAX_MODULES; i++) {   // tapes get their audio back
+    for (int i = 0; i < MAX_MODULES; i++) {   // tapes and samplers get their audio back
         Module *m = &mods[i];
-        if (!m->alive || m->type != M_TAPE) continue;
-        TapeSt *s = m->st;
-        proj_file(path, sizeof path, slug, TextFormat("tape-%u.wav", s->id));
-        if (FileExists(path)) tape_read_audio(m, path);
-        s->dirty = false;
-        s->savedT = GetTime();
+        const ModDef *d = &DEFS[m->type];
+        if (!m->alive || !d->audio_load) continue;
+        unsigned id = *d->audio_id(m);
+        proj_file(path, sizeof path, slug, TextFormat("audio-%u.wav", id));
+        if (!FileExists(path)) proj_file(path, sizeof path, slug, TextFormat("tape-%u.wav", id));   // older projects
+        if (FileExists(path)) d->audio_load(m, path);
     }
     free(proj_last);
     proj_last = text;
@@ -2543,10 +3788,9 @@ static void project_duplicate(const char *name)
     snprintf(proj_name, sizeof proj_name, "%s", name);
     proj_unique_slug(name, proj_slug);
     free(proj_last); proj_last = NULL;
-    for (int i = 0; i < MAX_MODULES; i++)   // write every tape into the copy
-        if (mods[i].alive && mods[i].type == M_TAPE) ((TapeSt *)mods[i].st)->dirty = true;
     proj_set_current();
     project_save(true);
+    if (proj_save_audio(SAVE_ALL)) fs_sync();   // every tape and sample into the copy
 }
 
 static void project_rename(const char *name)
@@ -2796,7 +4040,7 @@ static struct {
     double  videoT;
 } ui = { .lastKnobMod = -1, .toastT = -10 };
 
-static const int MENU_ORDER[M_COUNT] = { M_CLOCK, M_LFO, M_SEQ, M_CHORD, M_ARP, M_PERF, M_OSC3, M_TAPE, M_REVERB, M_OUT };
+static const int MENU_ORDER[M_COUNT] = { M_CLOCK, M_LFO, M_SEQ, M_CHORD, M_ARP, M_PERF, M_OSC3, M_DRUMS, M_SAMPLER, M_TAPE, M_REVERB, M_OUT };
 #define MENU_W 160
 #define MENU_ITEM_H 24
 #define MENU_N (M_COUNT + 1)   // modules + "PRESET RACK..."
@@ -3282,7 +4526,10 @@ static void handle_input(void)
                 if ((po && cables[c].fm == pm && cables[c].fo == pi) || (!po && cables[c].tm == pm && cables[c].ti == pi))
                     remove_cable(c);
             rebuild_routing();
-        } else if (module_at(mp) < 0) {
+        } else if (module_at(mp) >= 0) {
+            Module *m = &mods[module_at(mp)];
+            if (DEFS[m->type].rpress) DEFS[m->type].rpress(m, mp, custom_rect(m));
+        } else {
             ui.menu = true;
             ui.menuPos = mp;
             float maxY = GetScreenHeight() - 40 - MENU_N * MENU_ITEM_H;
@@ -3330,7 +4577,10 @@ static void handle_input(void)
     }
 
     float wheel = GetMouseWheelMove();
-    int ki, kk;
+    int ki, kk, wm = module_at(mp);
+    if (wheel != 0 && ui.mode == D_NONE && wm >= 0 && DEFS[mods[wm].type].wheel &&
+        CheckCollisionPointRec(mp, custom_rect(&mods[wm])) && DEFS[mods[wm].type].wheel(&mods[wm], mp, custom_rect(&mods[wm]), wheel))
+        wheel = 0;
     if (wheel != 0 && ui.mode == D_NONE && knob_at(mp, &ki, &kk)) {
         const KnobDef *kd = &DEFS[mods[ki].type].knobs[kk];
         if (kd->kind == K_STEP || kd->kind == K_SEG)
@@ -3532,6 +4782,7 @@ static void handle_audio_files(Vector2 mp)
         if (path[0]) {
             Module *m = &mods[g_pickTarget];
             if (m->alive && m->type == M_TAPE) tape_load(m, path);
+            if (m->alive && m->type == M_SAMPLER) sampler_load(m, path);
             remove(path);
             g_pickTarget = -1;
         }
@@ -3543,12 +4794,14 @@ static void handle_audio_files(Vector2 mp)
 #endif
     FilePathList dropped = LoadDroppedFiles();
     int target = module_at(mp);
-    if (target >= 0 && mods[target].type != M_TAPE) target = -1;
+    if (target >= 0 && mods[target].type != M_TAPE && mods[target].type != M_SAMPLER) target = -1;
     for (unsigned int i = 0; i < dropped.count; i++) {
         int t = target;
         if (t < 0 || i > 0)   // dropped on empty space: a new tape for each file
             t = add_module(M_TAPE, mp.x - pan.x + i * 24, mp.y - pan.y + i * 24);
-        if (t >= 0) tape_load(&mods[t], dropped.paths[i]);
+        if (t < 0) continue;
+        if (mods[t].type == M_SAMPLER) sampler_load(&mods[t], dropped.paths[i]);
+        else tape_load(&mods[t], dropped.paths[i]);
     }
     UnloadDroppedFiles(dropped);
 }
@@ -3570,6 +4823,11 @@ static void frame(void)
 #endif
     if (!rack_ready && fs_ready()) { rack_load(); project_boot(); }
     project_tick();
+    for (int i = 0; i < MAX_MODULES; i++)   // pre-render drum kits a little each frame
+        if (mods[i].alive && mods[i].type == M_DRUMS) {
+            for (int k = 0; k < N_KITS; k++) if (!kits[k].ready) { kit_work(k, 0.003); break; }
+            break;
+        }
     handle_audio_files(GetMousePosition());
     handle_input();
     if (ui.recOn && !g_recording) {   // stopped by hand or full: offer to save it
@@ -3673,6 +4931,7 @@ int main(void)
 {
     parse_progressions();
     parse_phrases();
+    for (int i = 0; i < N_KITS; i++) KIT_NAMES[i] = KITS[i].name;
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(1280, 760, "raya");
