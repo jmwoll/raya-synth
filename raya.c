@@ -1609,7 +1609,7 @@ static void draw_cable(Vector2 a, Vector2 b, Color c, float alpha)
 // Interaction
 // ---------------------------------------------------------------------------
 
-enum { D_NONE, D_MODULE, D_KNOB, D_CABLE, D_PAN, D_CUSTOM, D_BOX };
+enum { D_NONE, D_MODULE, D_KNOB, D_CABLE, D_PAN, D_CUSTOM, D_BOX, D_MAP };
 enum { MODAL_NONE, MODAL_RACK, MODAL_SAVE };
 
 static struct {
@@ -1650,6 +1650,77 @@ static void toast(const char *s) { snprintf(ui.toast, sizeof ui.toast, "%s", s);
 
 static Rectangle btn_rack(void) { return (Rectangle){ GetScreenWidth() - 18 - 150.0f, 14, 150, 26 }; }
 static Rectangle btn_save(void) { Rectangle r = btn_rack(); return (Rectangle){ r.x - 10 - 190, r.y, 190, 26 }; }
+
+// --- patch overview (minimap) ---------------------------------------------
+
+#define MAP_W 200
+#define MAP_H 124
+
+typedef struct { bool show; Rectangle box; float s; Vector2 o; } Minimap;  // map = o + world * s
+
+static Minimap minimap(void)
+{
+    Minimap m = { .box = { GetScreenWidth() - 18.0f - MAP_W, 52, MAP_W, MAP_H } };
+    // fit the patch itself; the view frame is clipped to the box
+    float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    for (int i = 0; i < MAX_MODULES; i++) {
+        if (!mods[i].alive) continue;
+        Rectangle r = module_rect(&mods[i]);
+        float wx = r.x - pan.x, wy = r.y - pan.y;
+        if (!m.show) { x0 = wx; y0 = wy; x1 = wx + r.width; y1 = wy + r.height; }
+        x0 = fminf(x0, wx); y0 = fminf(y0, wy);
+        x1 = fmaxf(x1, wx + r.width); y1 = fmaxf(y1, wy + r.height);
+        m.show = true;
+    }
+    if (!m.show) return m;
+    float pad = 8;
+    m.s = fminf((MAP_W - 2 * pad) / (x1 - x0), (MAP_H - 2 * pad) / (y1 - y0));
+    m.o.x = m.box.x + (MAP_W - (x1 - x0) * m.s) / 2 - x0 * m.s;
+    m.o.y = m.box.y + (MAP_H - (y1 - y0) * m.s) / 2 - y0 * m.s;
+    return m;
+}
+
+static Minimap mapDrag;   // layout frozen while dragging inside the overview
+
+static Vector2 map_pt(const Minimap *m, Vector2 screen)   // screen position -> minimap
+{
+    return (Vector2){ m->o.x + (screen.x - pan.x) * m->s, m->o.y + (screen.y - pan.y) * m->s };
+}
+
+static void map_center_view(const Minimap *m, Vector2 mp)  // pan so the clicked spot is centred
+{
+    Vector2 w = { (mp.x - m->o.x) / m->s, (mp.y - m->o.y) / m->s };
+    pan.x = GetScreenWidth() / 2.0f - w.x;
+    pan.y = GetScreenHeight() / 2.0f - w.y;
+}
+
+static void draw_minimap(Vector2 mp)
+{
+    Minimap m = minimap();
+    if (!m.show) return;
+    bool hover = CheckCollisionPointRec(mp, m.box) || ui.mode == D_MAP;
+    DrawRectangleRec(m.box, fade(INSET, hover ? 0.55f : 0.35f));
+    DrawRectangleLinesEx(m.box, 1, fade(PANEL_HI, hover ? 0.6f : 0.35f));
+    BeginScissorMode((int)m.box.x, (int)m.box.y, (int)m.box.width, (int)m.box.height);
+    for (int i = 0; i < MAX_MODULES; i++) {
+        if (!mods[i].alive) continue;
+        Rectangle r = module_rect(&mods[i]);
+        Vector2 a = map_pt(&m, (Vector2){ r.x, r.y });
+        Rectangle mr = { a.x, a.y, fmaxf(r.width * m.s, 2), fmaxf(r.height * m.s, 2) };
+        DrawRectangleRec(mr, sel[i] ? fade(ACCENT, 0.28f) : fade(PANEL_HI, 0.45f));
+        DrawRectangle((int)mr.x, (int)mr.y, 1, (int)mr.height, fade(WOOD, 0.5f));
+        DrawRectangle((int)(mr.x + mr.width - 1), (int)mr.y, 1, (int)mr.height, fade(WOOD, 0.5f));
+    }
+    for (int c = 0; c < ncables; c++) {
+        Cable *k = &cables[c];
+        Vector2 a = map_pt(&m, port_pos(&mods[k->fm], true, k->fo));
+        Vector2 b = map_pt(&m, port_pos(&mods[k->tm], false, k->ti));
+        DrawLineEx(a, b, 1, fade(CABLE_COLORS[k->color], 0.45f));
+    }
+    Vector2 v = map_pt(&m, (Vector2){ 0, 0 });
+    DrawRectangleLinesEx((Rectangle){ v.x, v.y, GetScreenWidth() * m.s, GetScreenHeight() * m.s }, 1, fade(TEXT, hover ? 0.5f : 0.3f));
+    EndScissorMode();
+}
 
 // --- rack picker geometry ---------------------------------------------------
 
@@ -1845,6 +1916,8 @@ static void handle_input(void)
         ui.press = mp;
         if (CheckCollisionPointRec(mp, btn_rack())) { open_rack(false, mp); return; }
         if (selection_count() && CheckCollisionPointRec(mp, btn_save())) { open_save(); return; }
+        Minimap mm = minimap();
+        if (mm.show && CheckCollisionPointRec(mp, mm.box)) { mapDrag = mm; map_center_view(&mm, mp); ui.mode = D_MAP; ui.last = mp; return; }
         if (find_port(mp, &pm, &pi, &po)) {
             ui.mode = D_CABLE;
             if (po) { ui.mod = pm; ui.idx = pi; ui.fromOut = true; ui.color = next_color++ % N_CABLE_COLORS; }
@@ -1914,6 +1987,7 @@ static void handle_input(void)
                 if (mods[i].alive && sel[i]) { mods[i].pos.x += delta.x; mods[i].pos.y += delta.y; }
             break;
         case D_PAN:    pan.x += delta.x; pan.y += delta.y; break;
+        case D_MAP: map_center_view(&mapDrag, mp); break;
         case D_KNOB: {
             const KnobDef *kd = &DEFS[mods[ui.mod].type].knobs[ui.idx];
             float range = kd->kind == K_STEP ? fmaxf(200.0f, (kd->max - kd->min) * 6.0f) : 200.0f;
@@ -2073,7 +2147,8 @@ static void frame(void)
     if (!rack_ready && fs_ready()) rack_load();
     handle_input();
     Vector2 mp = GetMousePosition();
-    bool overlay = ui.modal || ui.menu;
+    Minimap mm = minimap();
+    bool overlay = ui.modal || ui.menu || ui.mode == D_MAP || (mm.show && CheckCollisionPointRec(mp, mm.box));
 
     int hoverMod = overlay ? -1 : module_at(mp), hoverKnob = -1, km, kk;
     if (!overlay && knob_at(mp, &km, &kk) && km == hoverMod) hoverKnob = kk;
@@ -2111,6 +2186,7 @@ static void frame(void)
     txt("AMBIENT MODULAR", 18, 38, 10, TEXT_DIM);
     Vector2 bmp = overlay ? (Vector2){ -1, -1 } : mp;
     draw_button(btn_rack(), TextFormat("PRESET RACK  %d", rack_count), bmp, false);
+    draw_minimap(ui.modal || ui.menu ? (Vector2){ -1, -1 } : mp);
     int ns = selection_count();
     if (ns) draw_button(btn_save(), TextFormat("SAVE %d MODULE%s AS PRESET", ns, ns == 1 ? "" : "S"), bmp, true);
     txt("DRAG JACK TO JACK: PATCH   RIGHT-CLICK JACK: UNPLUG   RIGHT-CLICK SPACE: ADD   DRAG SPACE: PAN   SHIFT-DRAG SPACE: SELECT   P: PRESETS   S: SAVE SELECTION   DOUBLE-CLICK KNOB: RESET",
