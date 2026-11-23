@@ -19,8 +19,10 @@ export EMSDK_PYTHON
 EMCC := $(EMSDK)/upstream/emscripten/emcc
 
 CFLAGS  := -std=c99 -Wall -Os -DPLATFORM_WEB -I$(RAYLIB)
+# miniaudio's Web Audio backend reads Module.HEAPF32, which newer Emscripten
+# no longer exports by default.
 LDFLAGS := $(RAYLIB)/libraylib.a -sUSE_GLFW=3 -sALLOW_MEMORY_GROWTH=1 \
-           --shell-file shell.html
+           -sEXPORTED_RUNTIME_METHODS=HEAPF32 --shell-file shell.html
 
 .PHONY: all deps serve clean
 
