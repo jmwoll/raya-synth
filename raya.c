@@ -1336,13 +1336,27 @@ static void frame(void)
 
 static void default_layout(void)
 {
-    add_module(M_CLOCK,  24,  70);
-    add_module(M_LFO,    24, 270);
-    add_module(M_SEQ,   276,  70);
-    add_module(M_CHORD, 684,  70);
-    add_module(M_OSC3,  276, 360);
-    add_module(M_REVERB, 708, 360);
-    add_module(M_OUT,   964, 360);
+    int clk = add_module(M_CLOCK,  24,  70);
+    int lfo = add_module(M_LFO,    24, 270);
+    int seq = add_module(M_SEQ,   276,  70);
+    int chd = add_module(M_CHORD, 684,  70);
+    int osc = add_module(M_OSC3,  276, 360);
+    int rev = add_module(M_REVERB, 708, 360);
+    int out = add_module(M_OUT,   964, 360);
+
+    /* A starting patch that sounds right away: a drifting chord pad through
+       the reverb. Every cable can be pulled out and repatched. */
+    add_cable(clk, 0, seq, 0, 3);   /* 1/16 -> SEQ CLOCK      */
+    add_cable(clk, 2, chd, 0, 0);   /* BAR  -> CHORDS CLOCK   */
+    add_cable(chd, 0, osc, 0, 1);   /* N1..N3 -> P1..P3       */
+    add_cable(chd, 1, osc, 1, 1);
+    add_cable(chd, 2, osc, 2, 1);
+    add_cable(seq, 1, osc, 5, 3);   /* SEQ CV -> WAVE         */
+    add_cable(lfo, 0, osc, 4, 2);   /* SINE -> CUTOFF         */
+    add_cable(osc, 0, rev, 0, 4);   /* OSC -> REVERB -> OUT   */
+    add_cable(osc, 1, rev, 1, 4);
+    add_cable(rev, 0, out, 0, 0);
+    add_cable(rev, 1, out, 1, 0);
 }
 
 int main(void)

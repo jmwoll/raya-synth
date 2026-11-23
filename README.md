@@ -32,7 +32,7 @@ natively, and the door stays open to turn it into a VST plugin.
 
 Pitch cables carry octaves relative to C4; gates and modulation carry 0..1. Several cables into one input are summed.
 
-**Playing:** drag from jack to jack to patch. Right-click a jack to unplug it. Right-click empty space to add a module. Drag empty space to pan. Drag knobs vertically (Shift = fine), use the mouse wheel, double-click to reset.
+**Playing:** raya starts with a patch that already sounds: chords from CHORDS into 3X OSC, through REVERB to OUTPUT, with the LFO on the filter and the sequencer morphing the waveform. Click once to unlock audio in the browser. Drag from jack to jack to patch. Right-click a jack to unplug it. Right-click empty space to add a module. Drag empty space to pan. Drag knobs vertically (Shift = fine), use the mouse wheel, double-click to reset.
 
 ## Build
 
