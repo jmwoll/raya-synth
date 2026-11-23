@@ -121,7 +121,7 @@ There are 16 kits, loosely inspired by classic drum machines and recording style
 - **Checked against references:** measured against published descriptions of classic analog circuits, for example BOOMER's kick settling at 49 Hz, its cowbell at 540 and 800 Hz, and PUNCHY's kick sweeping down from about 250 Hz.
 - **Knobs:** **KIT**, **TUNE** (±12 semitones), **DECAY** (shortens every sound), **TONE** (darker ↔ thinner), **DRIVE** and **LEVEL**.
 
-The factory presets *boomer groove* and *dusty vinyl beat* drive DRUMS from three sequencers. To get every sound as a WAV file, run `make drum-samples`. It writes `drum-samples/<kit>/01-kick-1.wav` … `16-….wav` (48 kHz, 16-bit, mono).
+The factory presets *boomer groove* and *dusty vinyl beat* drive DRUMS from three sequencers.
 
 **About these sounds:**
 - **Who made them:** the drum sounds were created by Claude Opus 5.5, an AI model by Anthropic. It worked from rough, general descriptions of each machine's hardware characteristics: how its circuits or sample chips shape a kick, a snare, a hi-hat, and so on.
