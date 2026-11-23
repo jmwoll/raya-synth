@@ -171,7 +171,7 @@ enum { SAVE_LATER, SAVE_NOW, SAVE_ALL };   // how urgently a module stores its a
 static volatile int g_route;  // routing copy the audio thread should use
 static int    g_cur;          // routing copy used during the current audio block
 
-enum { M_CLOCK, M_SEQ, M_CHORD, M_OSC3, M_LFO, M_REVERB, M_OUT, M_TAPE, M_ARP, M_PERF, M_DRUMS, M_SAMPLER, M_COUNT };
+enum { M_CLOCK, M_SEQ, M_CHORD, M_OSC3, M_LFO, M_REVERB, M_OUT, M_TAPE, M_ARP, M_PERF, M_DRUMS, M_SAMPLER, M_FILTER, M_CHORUS, M_ARR, M_COUNT };
 static const ModDef DEFS[M_COUNT];
 
 static float IN(Module *m, int i)
@@ -2779,6 +2779,248 @@ static void sampler_audio_load(Module *m, const char *path)
 }
 
 // ---------------------------------------------------------------------------
+// FILTER — a low cut (high-pass) and a high cut (low-pass) in series, stereo.
+// The CV inputs open each cutoff by up to six octaves.
+// ---------------------------------------------------------------------------
+
+typedef struct { float ic1[4], ic2[4]; } FiltSt;
+
+static void filt_init(Module *m) { m->st = calloc(1, sizeof(FiltSt)); }
+
+// One step of a state-variable filter (Simper); returns low-pass, writes high-pass.
+static float svf(float x, float fc, float k, float *ic1, float *ic2, float *hp)
+{
+    float g = tanf(3.14159265f * clampf(fc, 10, SR * 0.45f) / SR);
+    float a1 = 1 / (1 + g * (g + k)), a2 = g * a1, a3 = g * a2;
+    float v3 = x - *ic2, v1 = a1 * *ic1 + a2 * v3, v2 = *ic2 + a2 * *ic1 + a3 * v3;
+    *ic1 = 2 * v1 - *ic1; *ic2 = 2 * v2 - *ic2;
+    *hp = x - k * v1 - v2;
+    return v2;
+}
+
+static void filt_process(Module *m)
+{
+    FiltSt *s = m->st;
+    float in[2] = { IN(m, 0), HAS(m, 1) ? IN(m, 1) : IN(m, 0) };
+    float lo = m->p[0] * exp2f(IN(m, 3) * m->p[3] * 6), hi = m->p[1] * exp2f(IN(m, 2) * m->p[3] * 6);
+    float k = 2 - 2 * m->p[2], hp;
+    for (int c = 0; c < 2; c++) {
+        float x = in[c];
+        svf(x, lo, 1.414f, &s->ic1[c], &s->ic2[c], &hp);              // low cut
+        m->out[c] = svf(hp, hi, k, &s->ic1[c + 2], &s->ic2[c + 2], &hp);   // high cut, resonant
+    }
+}
+
+static void filt_draw(Module *m, Rectangle a)   // the pass band on a log frequency axis
+{
+    DrawRectangleRec(a, INSET);
+    float lo = m->p[0] * exp2f(IN(m, 3) * m->p[3] * 6), hi = m->p[1] * exp2f(IN(m, 2) * m->p[3] * 6);
+    float span = log2f(20000.0f / 20), x0 = a.x + clampf(log2f(lo / 20) / span, 0, 1) * a.width, x1 = a.x + clampf(log2f(hi / 20) / span, 0, 1) * a.width;
+    if (x1 > x0) DrawRectangleRec((Rectangle){ x0, a.y + 6, x1 - x0, a.height - 12 }, fade(ACCENT, 0.18f));
+    DrawLineEx((Vector2){ x0, a.y + 4 }, (Vector2){ x0, a.y + a.height - 4 }, 1.5f, ACCENT);
+    DrawLineEx((Vector2){ x1, a.y + 4 }, (Vector2){ x1, a.y + a.height - 4 }, 1.5f, ACCENT);
+    txt(TextFormat("%.0f HZ", lo), a.x + 4, a.y + a.height - 13, 10, TEXT_DIM);
+    const char *h = hi < 1000 ? TextFormat("%.0f HZ", hi) : TextFormat("%.1f KHZ", hi / 1000);
+    txt(h, a.x + a.width - 4 - txt_w(h, 10), a.y + 3, 10, TEXT_DIM);
+}
+
+// ---------------------------------------------------------------------------
+// CHORUS — three slowly swept delay taps per side, spread across the stereo field
+// ---------------------------------------------------------------------------
+
+#define CH_LEN 4096
+
+typedef struct { float buf[2][CH_LEN]; int w; float ph; } ChorusSt;
+
+static void chorus_init(Module *m) { m->st = calloc(1, sizeof(ChorusSt)); }
+
+static void chorus_process(Module *m)
+{
+    ChorusSt *s = m->st;
+    float in[2] = { IN(m, 0), HAS(m, 1) ? IN(m, 1) : IN(m, 0) };
+    s->ph = fractf(s->ph + m->p[0] / SR);
+    s->w = (s->w + 1) & (CH_LEN - 1);
+    for (int c = 0; c < 2; c++) {
+        s->buf[c][s->w] = in[c];
+        float wet = 0;
+        for (int v = 0; v < 3; v++) {
+            float d = (0.010f + m->p[1] * 0.007f * (1 + sinf(TAU * (s->ph + v / 3.0f + c / 6.0f)))) * SR;
+            float rp = s->w - d;
+            if (rp < 0) rp += CH_LEN;
+            int i0 = (int)rp, i1 = (i0 + 1) & (CH_LEN - 1);
+            float fr = rp - i0;
+            wet += s->buf[c][i0] * (1 - fr) + s->buf[c][i1] * fr;
+        }
+        m->out[c] = in[c] * (1 - m->p[2] * 0.5f) + wet / 3 * m->p[2];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ARRANGER — the song: up to 12 sections, each so many bars long, played in
+// order from a 1/16 clock. Each section lets lanes 1-8 through (IN n -> OUT n)
+// or mutes them, and sets a LEVEL that glides there slowly (filter sweeps).
+// RAMP rises from 0 to 1 across every section.
+// ---------------------------------------------------------------------------
+
+#define AR_SEC   12
+#define AR_LANES 8
+static const int AR_LENS[] = { 0, 1, 2, 4, 8, 12, 16, 24, 32, 48, 64 };
+#define AR_NLENS ((int)(sizeof AR_LENS / sizeof AR_LENS[0]))
+
+typedef struct {
+    bool  on[AR_SEC][AR_LANES];
+    int   len[AR_SEC];            // index into AR_LENS; 0 = section skipped
+    float level[AR_SEC];
+    int   sec, bar, step;
+    float pclk, prst, lvl;
+    int   dragLevel;              // section whose level is being dragged, or -1
+} ArrSt;
+
+static void arr_init(Module *m)
+{
+    ArrSt *s = calloc(1, sizeof(ArrSt));
+    for (int i = 0; i < 4; i++) {
+        s->len[i] = 4;   // 8 bars
+        s->level[i] = 0.25f + 0.25f * i;
+        for (int l = 0; l < AR_LANES; l++) s->on[i][l] = l <= i + 1;
+    }
+    s->step = -1;
+    s->dragLevel = -1;
+    m->st = s;
+}
+
+static int arr_next(const ArrSt *s, int from)   // next section that is not skipped
+{
+    for (int k = 1; k <= AR_SEC; k++) { int i = (from + k) % AR_SEC; if (s->len[i]) return i; }
+    return from;
+}
+
+static void arr_process(Module *m)
+{
+    ArrSt *s = m->st;
+    if (rising(IN(m, 1), &s->prst)) { s->sec = s->len[0] ? 0 : arr_next(s, 0); s->bar = 0; s->step = -1; }
+    if (rising(IN(m, 0), &s->pclk)) {
+        if (!s->len[s->sec]) s->sec = arr_next(s, s->sec);
+        if (++s->step >= 16) {
+            s->step = 0;
+            if (++s->bar >= AR_LENS[s->len[s->sec]]) { s->bar = 0; s->sec = arr_next(s, s->sec); }
+        }
+    }
+    for (int l = 0; l < AR_LANES; l++) m->out[l] = s->on[s->sec][l] ? IN(m, 2 + l) : 0;
+    float g = m->p[0];
+    s->lvl += (s->level[s->sec] - s->lvl) * (g < 0.01f ? 1 : 1 - expf(-1 / (g * SR)));
+    m->out[AR_LANES] = s->lvl;
+    int bars = AR_LENS[s->len[s->sec]];
+    m->out[AR_LANES + 1] = bars ? (s->bar * 16 + (s->step < 0 ? 0 : s->step) + 1) / (float)(bars * 16) : 0;
+}
+
+#define AR_LABEL_W 26
+static float arr_colw(Rectangle a) { return (a.width - AR_LABEL_W) / AR_SEC; }
+static Rectangle arr_head(Rectangle a, int i)  { float w = arr_colw(a); return (Rectangle){ a.x + AR_LABEL_W + i * w, a.y, w - 2, 26 }; }
+static Rectangle arr_cell(Rectangle a, int i, int l) { float w = arr_colw(a); return (Rectangle){ a.x + AR_LABEL_W + i * w, a.y + 30 + l * 17, w - 2, 15 }; }
+static Rectangle arr_lvl(Rectangle a, int i)   { float w = arr_colw(a); return (Rectangle){ a.x + AR_LABEL_W + i * w, a.y + 30 + AR_LANES * 17 + 2, w - 2, a.height - (30 + AR_LANES * 17 + 2) }; }
+
+static void arr_draw(Module *m, Rectangle a)
+{
+    ArrSt *s = m->st;
+    txt("LEN", a.x, a.y + 14, 10, TEXT_DIM);
+    for (int l = 0; l < AR_LANES; l++) txt(TextFormat("%d", l + 1), a.x + 8, arr_cell(a, 0, l).y + 3, 10, TEXT_DIM);
+    txt("LVL", a.x, arr_lvl(a, 0).y + 8, 10, TEXT_DIM);
+    for (int i = 0; i < AR_SEC; i++) {
+        bool cur = i == s->sec, used = s->len[i] > 0;
+        Rectangle h = arr_head(a, i);
+        DrawRectangleRec(h, cur ? fade(ACCENT, 0.25f) : INSET);
+        txt_c(TextFormat("%d", i + 1), h.x + h.width / 2, h.y + 2, 10, cur ? ACCENT : (used ? TEXT : fade(TEXT_DIM, 0.5f)));
+        txt_c(used ? TextFormat("%d", AR_LENS[s->len[i]]) : "-", h.x + h.width / 2, h.y + 14, 10, used ? TEXT_DIM : fade(TEXT_DIM, 0.4f));
+        if (cur && used) {   // progress through the section
+            float p = (s->bar * 16 + (s->step < 0 ? 0 : s->step) + 1) / (float)(AR_LENS[s->len[i]] * 16);
+            DrawRectangle((int)h.x, (int)(h.y + h.height - 2), (int)(h.width * p), 2, ACCENT);
+        }
+        for (int l = 0; l < AR_LANES; l++) {
+            Rectangle c = arr_cell(a, i, l);
+            Color col = CABLE_COLORS[l % N_CABLE_COLORS];
+            DrawRectangleRec(c, s->on[i][l] ? fade(col, used ? (cur ? 0.85f : 0.5f) : 0.15f) : INSET);
+        }
+        Rectangle lv = arr_lvl(a, i);
+        DrawRectangleRec(lv, INSET);
+        float hgt = (lv.height - 2) * s->level[i];
+        DrawRectangleRec((Rectangle){ lv.x + 1, lv.y + lv.height - 1 - hgt, lv.width - 2, hgt }, fade(ACCENT, used ? (cur ? 0.8f : 0.45f) : 0.15f));
+    }
+}
+
+static void arr_set_level(ArrSt *s, Rectangle a, int i, float y)
+{
+    Rectangle lv = arr_lvl(a, i);
+    s->level[i] = clampf((lv.y + lv.height - y) / lv.height, 0, 1);
+}
+
+static bool arr_press(Module *m, Vector2 mp, Rectangle a)
+{
+    ArrSt *s = m->st;
+    s->dragLevel = -1;
+    for (int i = 0; i < AR_SEC; i++) {
+        if (CheckCollisionPointRec(mp, arr_head(a, i))) {   // jump to this section
+            if (!s->len[i]) s->len[i] = 4;
+            s->sec = i; s->bar = 0; s->step = -1;
+            return true;
+        }
+        for (int l = 0; l < AR_LANES; l++)
+            if (CheckCollisionPointRec(mp, arr_cell(a, i, l))) { s->on[i][l] = !s->on[i][l]; return true; }
+        if (CheckCollisionPointRec(mp, arr_lvl(a, i))) { s->dragLevel = i; arr_set_level(s, a, i, mp.y); return true; }
+    }
+    return CheckCollisionPointRec(mp, a);
+}
+
+static void arr_drag(Module *m, Vector2 mp, Rectangle a)
+{
+    ArrSt *s = m->st;
+    if (s->dragLevel >= 0) arr_set_level(s, a, s->dragLevel, mp.y);
+}
+
+static bool arr_wheel(Module *m, Vector2 mp, Rectangle a, float w)   // wheel on a header: section length
+{
+    ArrSt *s = m->st;
+    for (int i = 0; i < AR_SEC; i++)
+        if (CheckCollisionPointRec(mp, arr_head(a, i))) { s->len[i] = clampi(s->len[i] + (w > 0 ? 1 : -1), 0, AR_NLENS - 1); return true; }
+    return false;
+}
+
+static bool arr_rpress(Module *m, Vector2 mp, Rectangle a)   // right-click a header: skip the section
+{
+    ArrSt *s = m->st;
+    for (int i = 0; i < AR_SEC; i++)
+        if (CheckCollisionPointRec(mp, arr_head(a, i))) { s->len[i] = 0; return true; }
+    return false;
+}
+
+// data line: per section "bars:level:lanes" (lanes as 1/0 per lane)
+static void arr_save(const Module *m, char *out, int cap)
+{
+    const ArrSt *s = m->st;
+    int n = 0;
+    for (int i = 0; i < AR_SEC && n < cap; i++) {
+        n += snprintf(out + n, cap - n, "%s%d:%.3f:", i ? " " : "", AR_LENS[s->len[i]], s->level[i]);
+        for (int l = 0; l < AR_LANES && n < cap; l++) n += snprintf(out + n, cap - n, "%d", s->on[i][l]);
+    }
+}
+
+static void arr_load(Module *m, const char *str)
+{
+    ArrSt *s = m->st;
+    for (int i = 0; i < AR_SEC; i++) {
+        int bars, used; float lv; char lanes[AR_LANES + 1] = { 0 };
+        if (sscanf(str, " %d:%f:%8[01]%n", &bars, &lv, lanes, &used) != 3) break;
+        str += used;
+        s->len[i] = 0;
+        for (int k = 0; k < AR_NLENS; k++) if (AR_LENS[k] == bars) s->len[i] = k;
+        s->level[i] = clampf(lv, 0, 1);
+        for (int l = 0; l < AR_LANES; l++) s->on[i][l] = lanes[l] == '1';
+    }
+    s->sec = s->len[0] ? 0 : arr_next(s, 0);
+    s->lvl = s->level[s->sec];
+}
+
+// ---------------------------------------------------------------------------
 // Module registry
 // ---------------------------------------------------------------------------
 
@@ -2844,6 +3086,21 @@ static const ModDef DEFS[M_COUNT] = {
         .save = sampler_save, .load = sampler_load_data, .fini = sampler_fini,
         .audio_id = sampler_audio_id, .audio_save = sampler_audio_save, .audio_load = sampler_audio_load,
         .wheel = sampler_wheel, .rpress = sampler_rpress },
+    [M_FILTER] = { .name = "FILTER", .w = 236, .customH = 40, .nin = 4, .nout = 2, .nknob = 4,
+        .ins = { "IN L", "IN R", "HIGH CV", "LOW CV" }, .outs = { "L", "R" },
+        .knobs = { { "LOW CUT", 20, 4000, 20, K_EXP, F_HZ }, { "HIGH CUT", 80, 20000, 20000, K_EXP, F_HZ },
+                   { "RESO", 0, 0.9f, 0.15f, K_KNOB, F_PCT }, { "CV AMT", 0, 1, 0.5f, K_KNOB, F_PCT } },
+        .init = filt_init, .process = filt_process, .draw = filt_draw },
+    [M_CHORUS] = { .name = "CHORUS", .w = 236, .customH = 0, .nin = 2, .nout = 2, .nknob = 3,
+        .ins = { "IN L", "IN R" }, .outs = { "L", "R" },
+        .knobs = { { "RATE", 0.05f, 5, 0.4f, K_EXP, F_HZ }, { "DEPTH", 0, 1, 0.5f, K_KNOB, F_PCT }, { "MIX", 0, 1, 0.5f, K_KNOB, F_PCT } },
+        .init = chorus_init, .process = chorus_process },
+    [M_ARR] = { .name = "ARRANGER", .w = 560, .customH = 194, .nin = 10, .nout = 10, .nknob = 1,
+        .ins = { "CLOCK", "RESET", "IN1", "IN2", "IN3", "IN4", "IN5", "IN6", "IN7", "IN8" },
+        .outs = { "OUT1", "OUT2", "OUT3", "OUT4", "OUT5", "OUT6", "OUT7", "OUT8", "LEVEL", "RAMP" },
+        .knobs = { { "GLIDE", 0, 30, 4, K_KNOB, F_SEC } },
+        .init = arr_init, .process = arr_process, .draw = arr_draw, .press = arr_press, .drag = arr_drag,
+        .save = arr_save, .load = arr_load, .wheel = arr_wheel, .rpress = arr_rpress },
 };
 
 // Stable ids used in preset files.
@@ -2851,6 +3108,7 @@ static const char *MOD_ID[M_COUNT] = {
     [M_CLOCK] = "clock", [M_SEQ] = "seq", [M_CHORD] = "chords", [M_OSC3] = "osc3",
     [M_LFO] = "lfo", [M_REVERB] = "reverb", [M_OUT] = "output", [M_TAPE] = "tape",
     [M_ARP] = "arp", [M_PERF] = "performer", [M_DRUMS] = "drums", [M_SAMPLER] = "sampler",
+    [M_FILTER] = "filter", [M_CHORUS] = "chorus", [M_ARR] = "arranger",
 };
 
 // ---------------------------------------------------------------------------
@@ -3569,6 +3827,84 @@ static const struct { const char *name, *body; } FACTORY[] = {
       "cable 0 0 1 0 3\ncable 0 0 2 0 3\ncable 0 0 3 0 3\n"
       "cable 1 0 4 0 1\ncable 2 0 4 2 0\ncable 3 0 4 6 2\n"
       "cable 4 0 5 0 4\ncable 4 1 5 1 4\ncable 5 0 6 0 0\ncable 5 1 6 1 0\ncable 6 0 7 0 0\ncable 6 1 7 1 0\n" },
+    { "electro 128",
+      "module clock 0 0\nknob BPM 128\n"
+      "module arranger 256 0\nknob GLIDE 6\ndata 24:0.250:00000000 16:0.400:10010000 16:0.550:11101000 8:0.800:00000100 32:0.350:00000100 16:0.600:00001100 32:0.900:11001101 16:1.000:10011001 32:0.700:10101000 24:0.750:01101010 16:0.250:00010000 0:0.000:00000000\n"
+      "module chords 840 0\nknob PROG 52\nknob CHORD_LEN 0\nknob TRANSPOSE -1\n"
+      "module arp 1236 0\nknob MODE 0\nknob OCTAVES 2\nknob DIVIDE 2\nknob GATE 0.4\nknob CHANCE 0.9\n"
+      "module seq 0 420\nknob CHANCE 1\nknob GLIDE 0\ndata 0:0.500 0:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500\n"
+      "module seq 412 420\nknob CHANCE 0.95\nknob GLIDE 0\ndata 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500\n"
+      "module seq 824 420\nknob CHANCE 1\nknob GLIDE 0\ndata 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500 1:0.500 0:0.500\n"
+      "module seq 1236 420\nknob CHANCE 1\nknob GLIDE 0\ndata 0:0.000 0:0.000 1:0.000 1:0.000 0:0.000 0:0.000 1:0.000 1:0.583 0:0.000 0:0.000 1:0.000 1:0.000 0:0.000 0:0.000 1:0.000 1:1.000\n"
+      "module seq 1648 420\nknob CHANCE 1\nknob GLIDE 0\ndata 1:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 1:0.500 0:0.500\n"
+      "module seq 2060 420\nknob CHANCE 0.9\nknob GLIDE 0\ndata 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500\n"
+      "module drums 0 730\nknob KIT 1\nknob TONE -0.35\nknob LEVEL 0.55\n"
+      "module osc3 624 730\nknob OCTAVE -1\nknob WAVE 0.85\nknob DETUNE 0.15\nknob CUTOFF 260\nknob RESO 0.45\nknob ATTACK 0.004\nknob RELEASE 0.14\nknob GLIDE 0\nknob MOD_AMT 0.6\nknob LEVEL 0.9\n"
+      "module osc3 1060 730\nknob WAVE 0.75\nknob DETUNE 0.6\nknob CUTOFF 3000\nknob ATTACK 2.5\nknob RELEASE 4\nknob MOD_AMT 0.3\nknob LEVEL 1\n"
+      "module osc3 1496 730\nknob OCTAVE 1\nknob WAVE 0.45\nknob DETUNE 0.25\nknob CUTOFF 2600\nknob RESO 0.3\nknob ATTACK 0.005\nknob RELEASE 0.35\nknob GLIDE 0.02\nknob LEVEL 0.65\n"
+      "module filter 624 1110\nknob LOW_CUT 150\nknob HIGH_CUT 1300\nknob RESO 0.25\nknob CV_AMT 0.5\n"
+      "module chorus 884 1110\nknob RATE 0.35\nknob DEPTH 0.6\nknob MIX 0.55\n"
+      "module tape 1144 1110\nknob TIME 0.3516\nknob FEEDBACK 0.45\nknob WOW 0.15\nknob MIX 0.35\ndata 1 1\n"
+      "module reverb 1580 1110\nknob SIZE 1.4\nknob DECAY 6\nknob MIX 0.35\n"
+      "module output 1840 1110\n"
+      "cable 0 0 1 0 3\n"
+      "cable 0 0 4 0 3\n"
+      "cable 0 0 5 0 3\n"
+      "cable 0 0 6 0 3\n"
+      "cable 0 0 7 0 3\n"
+      "cable 0 0 8 0 3\n"
+      "cable 0 0 9 0 3\n"
+      "cable 0 0 3 4 3\n"
+      "cable 0 1 1 2 1\n"
+      "cable 0 2 2 0 0\n"
+      "cable 4 0 1 3 0\n"
+      "cable 5 0 1 4 2\n"
+      "cable 6 0 1 5 2\n"
+      "cable 7 0 1 6 1\n"
+      "cable 3 1 1 7 4\n"
+      "cable 8 0 1 8 1\n"
+      "cable 9 0 1 9 2\n"
+      "cable 1 0 10 0 1\n"
+      "cable 1 1 10 4 0\n"
+      "cable 1 2 10 6 2\n"
+      "cable 1 3 10 7 2\n"
+      "cable 1 4 11 3 1\n"
+      "cable 1 5 13 3 4\n"
+      "cable 1 6 10 0 1\n"
+      "cable 1 7 10 14 2\n"
+      "cable 1 8 14 2 3\n"
+      "cable 2 0 3 0 1\n"
+      "cable 2 1 3 1 1\n"
+      "cable 2 2 3 2 1\n"
+      "cable 2 3 3 3 1\n"
+      "cable 2 0 12 0 1\n"
+      "cable 2 1 12 1 1\n"
+      "cable 2 2 12 2 1\n"
+      "cable 2 4 11 0 0\n"
+      "cable 7 1 11 0 3\n"
+      "cable 2 4 11 1 0\n"
+      "cable 7 1 11 1 3\n"
+      "cable 2 4 11 2 0\n"
+      "cable 7 1 11 2 3\n"
+      "cable 3 0 13 0 4\n"
+      "cable 3 0 13 1 4\n"
+      "cable 3 0 13 2 4\n"
+      "cable 12 0 14 0 4\n"
+      "cable 12 1 14 1 4\n"
+      "cable 14 0 15 0 4\n"
+      "cable 14 1 15 1 4\n"
+      "cable 15 0 17 0 4\n"
+      "cable 15 1 17 1 4\n"
+      "cable 13 0 16 0 2\n"
+      "cable 13 1 16 1 2\n"
+      "cable 16 0 17 0 2\n"
+      "cable 16 1 17 1 2\n"
+      "cable 17 0 18 0 0\n"
+      "cable 17 1 18 1 0\n"
+      "cable 10 0 18 0 1\n"
+      "cable 10 1 18 1 1\n"
+      "cable 11 0 18 0 3\n"
+      "cable 11 1 18 1 3\n" },
 };
 #define N_FACTORY ((int)(sizeof FACTORY / sizeof FACTORY[0]))
 
@@ -4046,7 +4382,7 @@ static struct {
     double  videoT;
 } ui = { .lastKnobMod = -1, .toastT = -10 };
 
-static const int MENU_ORDER[M_COUNT] = { M_CLOCK, M_LFO, M_SEQ, M_CHORD, M_ARP, M_PERF, M_OSC3, M_DRUMS, M_SAMPLER, M_TAPE, M_REVERB, M_OUT };
+static const int MENU_ORDER[M_COUNT] = { M_CLOCK, M_ARR, M_LFO, M_SEQ, M_CHORD, M_ARP, M_PERF, M_OSC3, M_DRUMS, M_SAMPLER, M_TAPE, M_FILTER, M_CHORUS, M_REVERB, M_OUT };
 #define MENU_W 160
 #define MENU_ITEM_H 24
 #define MENU_N (M_COUNT + 1)   // modules + "PRESET RACK..."

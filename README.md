@@ -32,6 +32,9 @@ natively, and the door stays open to turn it into a VST plugin.
 | DRUMS | 16 drum kits with 16 pads each, every pad with its own trigger input (see below). |
 | SAMPLER | Plays regions of an audio file between up to 8 markers (see below). |
 | TAPE | A tape loop that plays, records and overdubs (see below). |
+| ARRANGER | The song: up to 12 sections played in order (see below). |
+| FILTER | Low cut (high-pass) and high cut (low-pass, resonant) in series, stereo, with a CV input for each cutoff. |
+| CHORUS | Stereo chorus from three swept delay taps per side: rate, depth, mix. |
 | REVERB | Large, modulated 8-line feedback delay network. |
 | OUTPUT | Final destination with soft limiter, scope and meters. |
 
@@ -66,6 +69,20 @@ PERFORMER plays solo lines the way a player would in blues, jazz, rock or pop, s
 - Some phrases slide into notes.
 
 The factory presets *chord arpeggio* and *pentatonic performer* show both modules in a patch.
+
+## Arranger
+
+ARRANGER turns a looping patch into a song. Feed it the CLOCK's 1/16 output and it steps through up to 12 sections in order, then starts again.
+- **Length:** each section lasts a number of bars. Use the mouse wheel on a section's header to change it; right-click a header to skip that section.
+- **Lanes:** each section switches 8 lanes on or off. A lane passes whatever is patched into IN *n* to OUT *n*, for example a drum trigger, a bass gate or a lead gate, and mutes it in sections where it is off. Click a cell to toggle it.
+- **LEVEL:** each section sets a value (drag its bar) that the LEVEL output glides to over GLIDE seconds. That's useful for long filter sweeps.
+- **RAMP:** rises from 0 to 1 across every section.
+- Click a section's number to jump to it.
+
+The factory preset *electro 128* is a rough reproduction of a 128 BPM electro-house track:
+- **Structure:** 11 sections over 232 bars, mapped from an analysis of the track: intro, beat, drop-out, breakdown, drop, hat wash, deep groove, an electro-break return and the outro.
+- **Drums and bass:** a 909 kick, clap, hats and shaker, plus a rolling bass built from the chord root and a sequencer.
+- **Synths:** a chorused pad whose FILTER opens with the arranger's LEVEL, and an arpeggiated lead with a dotted-8th tape echo.
 
 ## Drums
 
