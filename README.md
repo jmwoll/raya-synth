@@ -11,7 +11,7 @@ natively, and the door stays open to turn it into a VST plugin.
 
 Here is a little demo showing the modular nature and live-changing of dials / stepping of the sequencer:
 
-<video src='https://github.com/user-attachments/assets/dedc22cf-9c75-4ca2-8f60-277346a54e30' width=180 />
+<video src="https://github.com/user-attachments/assets/dedc22cf-9c75-4ca2-8f60-277346a54e30" width=180>
 
 
 
