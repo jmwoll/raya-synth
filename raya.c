@@ -14,6 +14,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdarg.h>
+#include <ctype.h>
 
 #if defined(PLATFORM_WEB)
 #include <emscripten/emscripten.h>
@@ -21,10 +23,10 @@
 
 #define SR           48000.0f
 #define TAU          6.28318530718f
-#define MAX_MODULES  48
+#define MAX_MODULES  64
 #define MAX_IO       8
 #define MAX_KNOBS    12
-#define MAX_CABLES   160
+#define MAX_CABLES   256
 #define MAX_SRC      8
 
 static float clampf(float x, float a, float b) { return x < a ? a : x > b ? b : x; }
@@ -118,6 +120,9 @@ typedef struct {
     void (*draw)(Module *, Rectangle area);
     bool (*press)(Module *, Vector2 mouse, Rectangle area);
     void (*drag)(Module *, Vector2 mouse, Rectangle area);
+    // optional: extra state stored in presets (beyond knob values)
+    void (*save)(const Module *, char *out, int cap);
+    void (*load)(Module *, const char *data);
 } ModDef;
 
 struct Module {
@@ -138,6 +143,7 @@ static Module mods[MAX_MODULES];
 static Cable  cables[MAX_CABLES];
 static int    ncables;
 static int    next_color;
+static bool   sel[MAX_MODULES];   // selected in the UI
 static volatile int g_route;  // routing copy the audio thread should use
 static int    g_cur;          // routing copy used during the current audio block
 
@@ -302,6 +308,25 @@ static void seq_drag(Module *m, Vector2 mp, Rectangle a)
 {
     SeqSt *s = m->st;
     if (s->dragMode == 1) seq_set_val(m, mp, a);
+}
+
+static void seq_save(const Module *m, char *out, int cap)
+{
+    const SeqSt *s = m->st;
+    int n = 0;
+    for (int i = 0; i < 16 && n < cap; i++)
+        n += snprintf(out + n, cap - n, "%s%d:%.3f", i ? " " : "", s->on[i], s->val[i]);
+}
+
+static void seq_load(Module *m, const char *str)
+{
+    SeqSt *s = m->st;
+    for (int i = 0; i < 16; i++) {
+        int on, used; float v;
+        if (sscanf(str, " %d:%f%n", &on, &v, &used) != 2) break;
+        s->on[i] = on != 0; s->val[i] = clampf(v, 0, 1);
+        str += used;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -757,7 +782,7 @@ static const ModDef DEFS[M_COUNT] = {
         clock_init, clock_process, clock_draw, NULL, NULL },
     [M_SEQ] = { "SEQUENCER", 388, 112, 2, 2, 3, { "CLOCK", "RESET" }, { "GATE", "CV" },
         { { "LENGTH", 1, 16, 16, K_STEP, F_INT }, { "CHANCE", 0, 1, 0.8f, K_KNOB, F_PCT }, { "GLIDE", 0, 1, 0.15f, K_KNOB, F_SEC } },
-        seq_init, seq_process, seq_draw, seq_press, seq_drag },
+        seq_init, seq_process, seq_draw, seq_press, seq_drag, seq_save, seq_load },
     [M_CHORD] = { "CHORDS", 372, 72, 3, 6, 4, { "CLOCK", "ARP", "RESET" }, { "N1", "N2", "N3", "N4", "BASS", "ARP" },
         { { "PROG", 0, NPROG - 1, 0, K_STEP, F_PROG }, { "CHORD LEN", 0, 3, 2, K_SEG, F_INT, RATE_LABELS },
           { "TRANSPOSE", -12, 12, 0, K_STEP, F_SEMI }, { "OCTAVE", -2, 2, 0, K_STEP, F_OCT } },
@@ -779,6 +804,12 @@ static const ModDef DEFS[M_COUNT] = {
     [M_OUT] = { "OUTPUT", 236, 76, 2, 0, 1, { "L", "R" }, {0},
         { { "VOLUME", 0, 1.5f, 0.8f, K_KNOB, F_PCT } },
         out_init, out_process, out_draw, NULL, NULL },
+};
+
+// Stable ids used in preset files.
+static const char *MOD_ID[M_COUNT] = {
+    [M_CLOCK] = "clock", [M_SEQ] = "seq", [M_CHORD] = "chords", [M_OSC3] = "osc3",
+    [M_LFO] = "lfo", [M_REVERB] = "reverb", [M_OUT] = "output",
 };
 
 // ---------------------------------------------------------------------------
@@ -931,6 +962,7 @@ static int add_module(int type, float x, float y)
         for (int k = 0; k < d->nknob; k++) m->p[k] = d->knobs[k].def;
         d->init(m);
         m->alive = true;
+        sel[i] = false;
         return i;
     }
     return -1;
@@ -944,6 +976,7 @@ static void remove_cable(int c)
 static void remove_module(int i)
 {
     mods[i].alive = false;
+    sel[i] = false;
     for (int c = ncables - 1; c >= 0; c--)
         if (cables[c].fm == i || cables[c].tm == i) remove_cable(c);
     rebuild_routing();
@@ -1000,6 +1033,445 @@ static Rectangle close_rect(const Module *m)
 {
     Rectangle r = module_rect(m);
     return (Rectangle){ r.x + r.width - CHEEK - 22, r.y + 7, 14, 14 };
+}
+
+// ---------------------------------------------------------------------------
+// Preset rack — any selection of modules (knob values, step data and the
+// cables between them) is stored in a numbered slot, e.g. #1-warm-drone.
+// One text file per slot: <dir>/0001-warm-drone.raya. On the web the
+// directory lives in IndexedDB (IDBFS), so presets survive reloads.
+// ---------------------------------------------------------------------------
+
+#define PRESET_MAX      2048
+#define PRESET_NAME_MAX 40
+#if defined(PLATFORM_WEB)
+#define PRESET_ROOT "/raya"
+#else
+#define PRESET_ROOT "raya-data"
+#endif
+#define PRESET_DIR PRESET_ROOT "/presets"
+
+typedef struct {
+    bool  used;
+    char  name[PRESET_NAME_MAX + 1];   // as typed by the user
+    char  slug[PRESET_NAME_MAX + 1];   // my-pad-oscillator
+    char  file[PRESET_NAME_MAX + 16];  // 0001-my-pad-oscillator.raya
+    char  summary[96];                 // modules it contains
+    char *text;
+} Preset;
+
+static Preset rack[PRESET_MAX];   // rack[i] is slot #i+1
+static int    rack_count;
+static bool   rack_ready;
+
+static const char *preset_label(int slot) { return TextFormat("#%d-%s", slot + 1, rack[slot].slug); }
+
+static void make_slug(const char *name, char *out)
+{
+    int n = 0;
+    bool dash = false;
+    for (const char *c = name; *c && n < PRESET_NAME_MAX; c++) {
+        unsigned char ch = (unsigned char)*c;
+        if (!isalnum(ch)) { dash = true; continue; }
+        if (dash && n && n < PRESET_NAME_MAX - 1) out[n++] = '-';
+        dash = false;
+        out[n++] = (char)tolower(ch);
+    }
+    out[n] = 0;
+    if (!n) strcpy(out, "preset");
+}
+
+typedef struct { char *s; int len, cap; } Buf;
+
+static void bput(Buf *b, const char *fmt, ...)
+{
+    for (;;) {
+        va_list ap;
+        va_start(ap, fmt);
+        int n = vsnprintf(b->s + b->len, b->cap - b->len, fmt, ap);
+        va_end(ap);
+        if (n < b->cap - b->len) { b->len += n; return; }
+        b->cap = b->cap * 2 + n;
+        b->s = realloc(b->s, b->cap);
+    }
+}
+
+// "CHORD LEN" <-> "CHORD_LEN" so every line splits on spaces
+static void knob_key(const char *name, char *out)
+{
+    int i = 0;
+    for (; name[i] && i < 31; i++) out[i] = name[i] == ' ' ? '_' : name[i];
+    out[i] = 0;
+}
+
+static int knob_index(const ModDef *d, const char *key)
+{
+    char k[32];
+    for (int i = 0; i < d->nknob; i++) {
+        knob_key(d->knobs[i].name, k);
+        if (!strcmp(k, key)) return i;
+    }
+    return -1;
+}
+
+static int mod_type_from_id(const char *id)
+{
+    for (int t = 0; t < M_COUNT; t++) if (!strcmp(MOD_ID[t], id)) return t;
+    return -1;
+}
+
+static int selection_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_MODULES; i++) n += mods[i].alive && sel[i];
+    return n;
+}
+
+static void select_none(void) { memset(sel, 0, sizeof sel); }
+
+// Serialize the selected modules (positions relative to their top-left corner)
+// and the cables running between them. Caller frees.
+static char *preset_serialize(const char *name)
+{
+    Buf b = { malloc(1024), 0, 1024 };
+    int map[MAX_MODULES], n = 0;
+    float x0 = 1e9f, y0 = 1e9f;
+    for (int i = 0; i < MAX_MODULES; i++) {
+        map[i] = -1;
+        if (!mods[i].alive || !sel[i]) continue;
+        map[i] = n++;
+        x0 = fminf(x0, mods[i].pos.x);
+        y0 = fminf(y0, mods[i].pos.y);
+    }
+    bput(&b, "raya-preset 1\nname %s\n", name);
+    for (int i = 0; i < MAX_MODULES; i++) {
+        if (map[i] < 0) continue;
+        const Module *m = &mods[i];
+        const ModDef *d = &DEFS[m->type];
+        bput(&b, "module %s %.0f %.0f\n", MOD_ID[m->type], m->pos.x - x0, m->pos.y - y0);
+        for (int k = 0; k < d->nknob; k++) {
+            char key[32];
+            knob_key(d->knobs[k].name, key);
+            bput(&b, "knob %s %.6g\n", key, m->p[k]);
+        }
+        if (d->save) {
+            char data[512] = { 0 };
+            d->save(m, data, sizeof data);
+            bput(&b, "data %s\n", data);
+        }
+    }
+    for (int c = 0; c < ncables; c++) {
+        const Cable *k = &cables[c];
+        if (map[k->fm] >= 0 && map[k->tm] >= 0)
+            bput(&b, "cable %d %d %d %d %d\n", map[k->fm], k->fo, map[k->tm], k->ti, k->color);
+    }
+    return b.s;
+}
+
+// Iterate over the lines of a preset text.
+static const char *next_line(const char *p, char *line, int cap)
+{
+    int len = (int)strcspn(p, "\n");
+    int n = len < cap - 1 ? len : cap - 1;
+    memcpy(line, p, n);
+    line[n] = 0;
+    if (n && line[n - 1] == '\r') line[n - 1] = 0;
+    p += len;
+    return *p ? p + 1 : p;
+}
+
+// Add the preset's modules with their top-left corner at world position `at`.
+// The new modules become the selection. Returns how many modules were added.
+static int preset_instantiate(const char *text, Vector2 at)
+{
+    int map[MAX_MODULES], n = 0, added = 0;
+    Module *cur = NULL;
+    char line[1024];
+    select_none();
+    for (const char *p = text; *p; ) {
+        p = next_line(p, line, sizeof line);
+        char kw[16];
+        if (sscanf(line, "%15s", kw) != 1) continue;
+        if (!strcmp(kw, "module")) {
+            char id[32]; float x, y;
+            cur = NULL;
+            if (n >= MAX_MODULES) continue;
+            int idx = -1;
+            if (sscanf(line, "module %31s %f %f", id, &x, &y) == 3) {
+                int t = mod_type_from_id(id);
+                if (t >= 0) idx = add_module(t, at.x + x, at.y + y);
+            }
+            map[n++] = idx;
+            if (idx >= 0) { cur = &mods[idx]; sel[idx] = true; added++; }
+        } else if (!strcmp(kw, "knob") && cur) {
+            char key[32]; float v;
+            const ModDef *d = &DEFS[cur->type];
+            int k;
+            if (sscanf(line, "knob %31s %f", key, &v) == 2 && (k = knob_index(d, key)) >= 0)
+                cur->p[k] = clampf(v, d->knobs[k].min, d->knobs[k].max);
+        } else if (!strcmp(kw, "data") && cur) {
+            if (DEFS[cur->type].load) DEFS[cur->type].load(cur, line + 4);
+        } else if (!strcmp(kw, "cable")) {
+            int a, o, b, i, c;
+            if (sscanf(line, "cable %d %d %d %d %d", &a, &o, &b, &i, &c) == 5 &&
+                a >= 0 && a < n && b >= 0 && b < n && map[a] >= 0 && map[b] >= 0 &&
+                o >= 0 && o < DEFS[mods[map[a]].type].nout && i >= 0 && i < DEFS[mods[map[b]].type].nin)
+                add_cable(map[a], o, map[b], i, abs(c) % N_CABLE_COLORS);
+        }
+    }
+    rebuild_routing();
+    return added;
+}
+
+// Name and module summary for the rack listing.
+static void preset_describe(Preset *ps)
+{
+    int cnt[M_COUNT] = { 0 };
+    char line[256];
+    ps->name[0] = 0;
+    for (const char *p = ps->text; *p; ) {
+        p = next_line(p, line, sizeof line);
+        char id[32];
+        if (!strncmp(line, "name ", 5)) snprintf(ps->name, sizeof ps->name, "%s", line + 5);
+        else if (sscanf(line, "module %31s", id) == 1) {
+            int t = mod_type_from_id(id);
+            if (t >= 0) cnt[t]++;
+        }
+    }
+    if (!ps->name[0]) snprintf(ps->name, sizeof ps->name, "%s", ps->slug);
+    int n = 0;
+    ps->summary[0] = 0;
+    for (int t = 0; t < M_COUNT; t++) {
+        if (!cnt[t]) continue;
+        n += snprintf(ps->summary + n, sizeof ps->summary - n, "%s%s", n ? ", " : "", DEFS[t].name);
+        if (cnt[t] > 1) n += snprintf(ps->summary + n, sizeof ps->summary - n, " X%d", cnt[t]);
+        if (n >= (int)sizeof ps->summary) break;
+    }
+}
+
+static char *read_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *s = malloc(n + 1);
+    s[fread(s, 1, n, f)] = 0;
+    fclose(f);
+    return s;
+}
+
+static bool write_file(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = fwrite(text, 1, strlen(text), f) == strlen(text);
+    return fclose(f) == 0 && ok;
+}
+
+static bool fs_hold;   // batch several writes into one sync
+
+static void fs_sync(void)
+{
+    if (fs_hold) return;
+#if defined(PLATFORM_WEB)
+    emscripten_run_script("FS.syncfs(false, function (e) { if (e) console.error('raya: preset sync failed', e); });");
+#endif
+}
+
+static bool fs_ready(void)
+{
+#if defined(PLATFORM_WEB)
+    return emscripten_run_script_int("Module.rayaFsReady | 0") != 0;
+#else
+    return true;
+#endif
+}
+
+// Put a preset into its slot; takes ownership of text.
+static bool rack_put(int slot, const char *file, char *text)
+{
+    if (slot < 0 || slot >= PRESET_MAX || rack[slot].used || strncmp(text, "raya-preset", 11)) { free(text); return false; }
+    Preset *ps = &rack[slot];
+    memset(ps, 0, sizeof *ps);
+    ps->used = true;
+    ps->text = text;
+    snprintf(ps->file, sizeof ps->file, "%s", file);
+    const char *s = strchr(file, '-');               // slug = file name between "0001-" and ".raya"
+    int len = s ? (int)strlen(s + 1) - 5 : 0;
+    if (len > PRESET_NAME_MAX) len = PRESET_NAME_MAX;
+    if (len > 0) { memcpy(ps->slug, s + 1, len); ps->slug[len] = 0; } else strcpy(ps->slug, "preset");
+    preset_describe(ps);
+    rack_count++;
+    return true;
+}
+
+// Store a new preset in the lowest free slot; takes ownership of text.
+// Returns the slot, or -1 when the rack is full or the write failed.
+static int rack_store(const char *name, char *text)
+{
+    int slot = 0;
+    while (slot < PRESET_MAX && rack[slot].used) slot++;
+    char slug[PRESET_NAME_MAX + 1], file[PRESET_NAME_MAX + 16];
+    make_slug(name, slug);
+    snprintf(file, sizeof file, "%04d-%s.raya", slot + 1, slug);
+    if (slot >= PRESET_MAX || !write_file(TextFormat("%s/%s", PRESET_DIR, file), text)) { free(text); return -1; }
+    rack_put(slot, file, text);
+    fs_sync();
+    return slot;
+}
+
+static void rack_delete(int slot)
+{
+    if (!rack[slot].used) return;
+    remove(TextFormat("%s/%s", PRESET_DIR, rack[slot].file));
+    free(rack[slot].text);
+    memset(&rack[slot], 0, sizeof rack[slot]);
+    rack_count--;
+    fs_sync();
+}
+
+// Factory presets: seeded into an empty rack on first start. Positions are
+// relative; module order defines the indices used by the cable lines.
+static const struct { const char *name, *body; } FACTORY[] = {
+    { "ambient starter",
+      "module clock 0 0\n"
+      "module lfo 0 200\n"
+      "module seq 252 0\n"
+      "module chords 660 0\n"
+      "module osc3 252 290\n"
+      "module reverb 684 290\n"
+      "module output 940 290\n"
+      "cable 0 0 2 0 3\ncable 0 2 3 0 0\n"
+      "cable 3 0 4 0 1\ncable 3 1 4 1 1\ncable 3 2 4 2 1\n"
+      "cable 2 1 4 5 3\ncable 1 0 4 4 2\n"
+      "cable 4 0 5 0 4\ncable 4 1 5 1 4\ncable 5 0 6 0 0\ncable 5 1 6 1 0\n" },
+    { "warm drone",
+      "module osc3 0 0\n"
+      "knob OCTAVE -1\nknob WAVE 0.2\nknob DETUNE 0.5\nknob CUTOFF 600\nknob ATTACK 6\n"
+      "module reverb 436 0\n"
+      "knob SIZE 1.4\nknob DECAY 18\nknob MIX 0.55\n"
+      "module output 696 0\n"
+      "cable 0 0 1 0 4\ncable 0 1 1 1 4\ncable 1 0 2 0 0\ncable 1 1 2 1 0\n" },
+    { "glass pad",
+      "module lfo 0 0\n"
+      "knob RATE 0.03\n"
+      "module osc3 256 0\n"
+      "knob OCTAVE 1\nknob WAVE 0.05\nknob DETUNE 0.15\nknob CUTOFF 3500\nknob RESO 0.35\n"
+      "knob ATTACK 5\nknob RELEASE 10\nknob MOD_AMT 0.6\nknob LEVEL 0.5\n"
+      "module reverb 692 0\n"
+      "knob SIZE 1.8\nknob DECAY 30\nknob DAMP 0.2\nknob MIX 0.7\n"
+      "module output 952 0\n"
+      "cable 0 2 1 4 2\ncable 1 0 2 0 4\ncable 1 1 2 1 4\ncable 2 0 3 0 0\ncable 2 1 3 1 0\n" },
+    { "breathing chords",
+      "module clock 0 0\n"
+      "knob BPM 60\n"
+      "module chords 256 0\n"
+      "knob PROG 5\nknob CHORD_LEN 3\n"
+      "module osc3 0 300\n"
+      "knob WAVE 0.3\nknob CUTOFF 1100\nknob ATTACK 3\nknob GLIDE 1.2\n"
+      "module reverb 436 300\n"
+      "module output 696 300\n"
+      "cable 0 2 1 0 0\ncable 1 0 2 0 1\ncable 1 1 2 1 1\ncable 1 2 2 2 1\n"
+      "cable 2 0 3 0 4\ncable 2 1 3 1 4\ncable 3 0 4 0 0\ncable 3 1 4 1 0\n" },
+    { "sequenced swells",
+      "module clock 0 0\n"
+      "knob BPM 66\n"
+      "module seq 256 0\n"
+      "knob CHANCE 0.7\nknob GLIDE 0.4\n"
+      "data 1:0.200 0:0.500 1:0.650 0:0.300 1:0.900 0:0.400 0:0.700 1:0.350 "
+      "1:0.550 0:0.250 1:0.800 0:0.600 0:0.150 1:0.450 0:0.950 1:0.300\n"
+      "module osc3 0 300\n"
+      "knob WAVE 0.45\nknob CUTOFF 500\nknob ATTACK 0.6\nknob RELEASE 4\nknob MOD_AMT 0.7\n"
+      "module reverb 436 300\n"
+      "knob DECAY 16\nknob MIX 0.6\n"
+      "module output 696 300\n"
+      "cable 0 1 1 0 3\ncable 1 0 2 3 1\ncable 1 1 2 4 2\n"
+      "cable 2 0 3 0 4\ncable 2 1 3 1 4\ncable 3 0 4 0 0\ncable 3 1 4 1 0\n" },
+    { "arp shimmer",
+      "module clock 0 0\n"
+      "module seq 256 0\n"
+      "knob CHANCE 0.9\nknob GLIDE 0\n"
+      "module chords 668 0\n"
+      "knob PROG 12\n"
+      "module osc3 256 300\n"
+      "knob WAVE 0.15\nknob DETUNE 0.2\nknob CUTOFF 2400\nknob ATTACK 0.02\nknob RELEASE 2.5\n"
+      "knob GLIDE 0.05\nknob LEVEL 0.5\n"
+      "module reverb 692 300\n"
+      "knob SIZE 1.7\nknob DECAY 25\nknob MIX 0.65\n"
+      "module output 952 300\n"
+      "cable 0 0 1 0 3\ncable 0 2 2 0 0\ncable 1 1 2 1 2\ncable 2 5 3 0 1\ncable 1 0 3 3 3\n"
+      "cable 3 0 4 0 4\ncable 3 1 4 1 4\ncable 4 0 5 0 0\ncable 4 1 5 1 0\n" },
+    { "deep drone",
+      "module lfo 0 0\n"
+      "knob RATE 0.02\n"
+      "module osc3 256 0\n"
+      "knob OCTAVE -2\nknob WAVE 0.55\nknob DETUNE 0.6\nknob CUTOFF 280\nknob RESO 0.4\n"
+      "knob ATTACK 8\nknob MOD_AMT 0.4\n"
+      "module reverb 692 0\n"
+      "knob DECAY 20\nknob DAMP 0.6\n"
+      "module output 952 0\n"
+      "cable 0 0 1 4 2\ncable 1 0 2 0 4\ncable 1 1 2 1 4\ncable 2 0 3 0 0\ncable 2 1 3 1 0\n" },
+    { "chord brain",
+      "module clock 0 0\n"
+      "knob BPM 64\n"
+      "module chords 256 0\n"
+      "cable 0 2 1 0 0\n" },
+    { "slow drift",
+      "module lfo 0 0\n"
+      "knob RATE 0.015\nknob DEPTH 0.8\n" },
+    { "endless hall",
+      "module reverb 0 0\n"
+      "knob SIZE 1.9\nknob DECAY 40\nknob DAMP 0.55\nknob MIX 0.75\n"
+      "module output 260 0\n"
+      "cable 0 0 1 0 0\ncable 0 1 1 1 0\n" },
+};
+#define N_FACTORY ((int)(sizeof FACTORY / sizeof FACTORY[0]))
+
+static char *factory_text(int i)
+{
+    Buf b = { malloc(1024), 0, 1024 };
+    bput(&b, "raya-preset 1\nname %s\n%s", FACTORY[i].name, FACTORY[i].body);
+    return b.s;
+}
+
+static void rack_load(void)
+{
+    MakeDirectory(PRESET_DIR);
+    FilePathList fl = LoadDirectoryFiles(PRESET_DIR);
+    for (unsigned int i = 0; i < fl.count; i++) {
+        const char *fn = GetFileName(fl.paths[i]);
+        int slot;
+        if (sscanf(fn, "%d-", &slot) != 1 || !IsFileExtension(fn, ".raya")) continue;
+        char *text = read_file(fl.paths[i]);
+        if (text) rack_put(slot - 1, fn, text);
+    }
+    UnloadDirectoryFiles(fl);
+    const char *seeded = PRESET_DIR "/.seeded";
+    if (!FileExists(seeded)) {
+        fs_hold = true;
+        for (int i = 0; i < N_FACTORY; i++) rack_store(FACTORY[i].name, factory_text(i));
+        write_file(seeded, "factory presets installed\n");
+        fs_hold = false;
+        fs_sync();
+    }
+    rack_ready = true;
+}
+
+// Case-insensitive: every space-separated word of the query must appear in
+// the slot label, the name or the module summary.
+static bool preset_matches(int slot, const char *query)
+{
+    char hay[256], q[PRESET_NAME_MAX + 1];
+    const Preset *ps = &rack[slot];
+    snprintf(hay, sizeof hay, "%s %s %s", preset_label(slot), ps->name, ps->summary);
+    snprintf(q, sizeof q, "%s", query);
+    for (char *c = hay; *c; c++) *c = (char)tolower((unsigned char)*c);
+    for (char *c = q; *c; c++) *c = (char)tolower((unsigned char)*c);
+    for (char *w = strtok(q, " "); w; w = strtok(NULL, " "))
+        if (!strstr(hay, w)) return false;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,47 +1609,242 @@ static void draw_cable(Vector2 a, Vector2 b, Color c, float alpha)
 // Interaction
 // ---------------------------------------------------------------------------
 
-enum { D_NONE, D_MODULE, D_KNOB, D_CABLE, D_PAN, D_CUSTOM };
+enum { D_NONE, D_MODULE, D_KNOB, D_CABLE, D_PAN, D_CUSTOM, D_BOX };
+enum { MODAL_NONE, MODAL_RACK, MODAL_SAVE };
 
 static struct {
     int     mode;
     int     mod, idx;
     bool    fromOut;
     int     color;
-    Vector2 last;
+    Vector2 last, press;
     float   t;
     bool    menu;
     Vector2 menuPos;
     double  lastClick;
     int     lastKnobMod, lastKnobIdx;
-} ui = { .lastKnobMod = -1 };
+    // preset rack + save dialog
+    int     modal;
+    char    text[PRESET_NAME_MAX + 1];   // search query or preset name
+    int     hl, scroll, confirmDel;      // confirmDel: slot + 1 armed for deletion
+    bool    placeAt;                     // load at placePos (opened from the context menu)
+    Vector2 placePos;
+    char    toast[96];
+    double  toastT;
+} ui = { .lastKnobMod = -1, .toastT = -10 };
 
 static const int MENU_ORDER[M_COUNT] = { M_CLOCK, M_LFO, M_SEQ, M_CHORD, M_OSC3, M_REVERB, M_OUT };
 #define MENU_W 160
 #define MENU_ITEM_H 24
+#define MENU_N (M_COUNT + 1)   // modules + "PRESET RACK..."
 
-static Rectangle menu_item(int i) { return (Rectangle){ ui.menuPos.x, ui.menuPos.y + 26 + i * MENU_ITEM_H, MENU_W, MENU_ITEM_H }; }
+static Rectangle menu_item(int i)
+{
+    float gap = i == M_COUNT ? 8 : 0;
+    return (Rectangle){ ui.menuPos.x, ui.menuPos.y + 26 + i * MENU_ITEM_H + gap, MENU_W, MENU_ITEM_H };
+}
+
+static void toast(const char *s) { snprintf(ui.toast, sizeof ui.toast, "%s", s); ui.toastT = GetTime(); }
+
+// --- top bar buttons --------------------------------------------------------
+
+static Rectangle btn_rack(void) { return (Rectangle){ GetScreenWidth() - 18 - 150.0f, 14, 150, 26 }; }
+static Rectangle btn_save(void) { Rectangle r = btn_rack(); return (Rectangle){ r.x - 10 - 190, r.y, 190, 26 }; }
+
+// --- rack picker geometry ---------------------------------------------------
+
+#define RACK_W 620
+#define ROW_H  30
+
+static int filt[PRESET_MAX], nfilt;
+
+static void rack_filter(void)
+{
+    nfilt = 0;
+    for (int i = 0; i < PRESET_MAX; i++)
+        if (rack[i].used && preset_matches(i, ui.text)) filt[nfilt++] = i;
+    ui.hl = clampi(ui.hl, 0, nfilt ? nfilt - 1 : 0);
+}
+
+static Rectangle rack_box(void)
+{
+    float w = fminf(RACK_W, GetScreenWidth() - 32.0f), h = fminf(640, GetScreenHeight() - 60.0f);
+    return (Rectangle){ (GetScreenWidth() - w) / 2, (GetScreenHeight() - h) / 2, w, h };
+}
+static Rectangle rack_search(void) { Rectangle b = rack_box(); return (Rectangle){ b.x + 16, b.y + 42, b.width - 32, 30 }; }
+static Rectangle rack_list(void)   { Rectangle b = rack_box(); return (Rectangle){ b.x + 16, b.y + 84, b.width - 32, b.height - 84 - 36 }; }
+static int       rack_visible(void) { int n = (int)(rack_list().height / ROW_H); return n < 1 ? 1 : n; }
+static Rectangle rack_row(int v)   { Rectangle l = rack_list(); return (Rectangle){ l.x, l.y + v * ROW_H, l.width, ROW_H }; }
+static Rectangle rack_del(Rectangle row) { return (Rectangle){ row.x + row.width - 28, row.y + 7, 16, 16 }; }
+
+static void rack_scroll_to_hl(void)
+{
+    int vis = rack_visible();
+    if (ui.hl < ui.scroll) ui.scroll = ui.hl;
+    if (ui.hl >= ui.scroll + vis) ui.scroll = ui.hl - vis + 1;
+    ui.scroll = clampi(ui.scroll, 0, nfilt > vis ? nfilt - vis : 0);
+}
+
+// --- save dialog geometry ---------------------------------------------------
+
+static Rectangle save_box(void)   { float w = fminf(460, GetScreenWidth() - 32.0f); return (Rectangle){ (GetScreenWidth() - w) / 2, GetScreenHeight() / 2 - 100.0f, w, 200 }; }
+static Rectangle save_field(void) { Rectangle b = save_box(); return (Rectangle){ b.x + 16, b.y + 58, b.width - 32, 30 }; }
+static Rectangle save_ok(void)    { Rectangle b = save_box(); return (Rectangle){ b.x + b.width - 16 - 100, b.y + b.height - 44, 100, 28 }; }
+static Rectangle save_cancel(void){ Rectangle r = save_ok(); return (Rectangle){ r.x - 10 - 100, r.y, 100, 28 }; }
+
+static int next_free_slot(void) { int s = 0; while (s < PRESET_MAX && rack[s].used) s++; return s; }
+
+// --- actions ------------------------------------------------------------------
+
+static void drain_chars(void) { while (GetCharPressed()) {} }
+
+static void open_rack(bool at, Vector2 pos)
+{
+    ui.modal = MODAL_RACK;
+    ui.text[0] = 0;
+    ui.hl = ui.scroll = ui.confirmDel = 0;
+    ui.placeAt = at; ui.placePos = pos;
+    ui.menu = false;
+    drain_chars();
+}
+
+static void open_save(void)
+{
+    if (!selection_count()) { toast("SELECT MODULES FIRST: CLICK A HEADER OR SHIFT-DRAG"); return; }
+    ui.modal = MODAL_SAVE;
+    ui.text[0] = 0;
+    ui.menu = false;
+    drain_chars();
+}
+
+static void load_preset(int slot)
+{
+    Vector2 at;
+    if (ui.placeAt) at = (Vector2){ ui.placePos.x - pan.x, ui.placePos.y - pan.y };
+    else {  // to the right of everything already in the rack
+        bool any = false;
+        float maxX = 0, minY = 0;
+        for (int i = 0; i < MAX_MODULES; i++) {
+            if (!mods[i].alive) continue;
+            float r = mods[i].pos.x + DEFS[mods[i].type].w;
+            if (!any || r > maxX) maxX = r;
+            if (!any || mods[i].pos.y < minY) minY = mods[i].pos.y;
+            any = true;
+        }
+        at = any ? (Vector2){ maxX + 40, minY } : (Vector2){ 24 - pan.x, 70 - pan.y };
+    }
+    int n = preset_instantiate(rack[slot].text, at);
+    if (!ui.placeAt && n) {   // bring the new modules into view
+        float sx = at.x + pan.x, sy = at.y + pan.y;
+        if (sx < 0 || sx > GetScreenWidth() - 240 || sy < 0 || sy > GetScreenHeight() - 120) {
+            pan.x = 24 - at.x; pan.y = 70 - at.y;
+        }
+    }
+    toast(n ? TextFormat("LOADED %s", preset_label(slot)) : "NO ROOM FOR MORE MODULES");
+    ui.modal = MODAL_NONE;
+}
+
+static void do_save(void)
+{
+    if (!ui.text[0]) return;
+    int slot = rack_store(ui.text, preset_serialize(ui.text));
+    if (slot >= 0) toast(TextFormat("SAVED AS %s", preset_label(slot)));
+    else toast(rack_count >= PRESET_MAX ? TextFormat("PRESET RACK IS FULL (%d)", PRESET_MAX) : "COULD NOT WRITE PRESET");
+    ui.modal = MODAL_NONE;
+}
+
+static void text_input(void)
+{
+    int c, len = (int)strlen(ui.text);
+    while ((c = GetCharPressed()))
+        if (c >= 32 && c < 127 && len < PRESET_NAME_MAX) { ui.text[len++] = (char)c; ui.text[len] = 0; }
+    if ((IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) && len) ui.text[--len] = 0;
+}
+
+static void modal_input(Vector2 mp)
+{
+    bool click = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+    if (ui.modal == MODAL_SAVE) {
+        text_input();
+        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || (click && CheckCollisionPointRec(mp, save_ok()))) do_save();
+        else if (IsKeyPressed(KEY_ESCAPE) || (click && (CheckCollisionPointRec(mp, save_cancel()) || !CheckCollisionPointRec(mp, save_box()))))
+            ui.modal = MODAL_NONE;
+        return;
+    }
+    // MODAL_RACK
+    char before[sizeof ui.text];
+    strcpy(before, ui.text);
+    text_input();
+    if (strcmp(before, ui.text)) { ui.hl = 0; ui.scroll = 0; ui.confirmDel = 0; }
+    rack_filter();
+    if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN)) { ui.hl = clampi(ui.hl + 1, 0, nfilt ? nfilt - 1 : 0); rack_scroll_to_hl(); }
+    if (IsKeyPressed(KEY_UP) || IsKeyPressedRepeat(KEY_UP))     { ui.hl = clampi(ui.hl - 1, 0, nfilt ? nfilt - 1 : 0); rack_scroll_to_hl(); }
+    float wheel = GetMouseWheelMove();
+    if (wheel != 0) {
+        int vis = rack_visible();
+        ui.scroll = clampi(ui.scroll - (int)(wheel > 0 ? 1 : -1) * 2, 0, nfilt > vis ? nfilt - vis : 0);
+    }
+    if ((IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) && nfilt) { load_preset(filt[ui.hl]); return; }
+    if (IsKeyPressed(KEY_ESCAPE)) { ui.modal = MODAL_NONE; return; }
+    if (!click) return;
+    if (!CheckCollisionPointRec(mp, rack_box())) { ui.modal = MODAL_NONE; return; }
+    int vis = rack_visible();
+    for (int v = 0; v < vis && ui.scroll + v < nfilt; v++) {
+        Rectangle row = rack_row(v);
+        if (!CheckCollisionPointRec(mp, row)) continue;
+        int slot = filt[ui.scroll + v];
+        if (CheckCollisionPointRec(mp, rack_del(row))) {
+            if (ui.confirmDel == slot + 1) {
+                toast(TextFormat("DELETED %s", preset_label(slot)));
+                rack_delete(slot);
+                ui.confirmDel = 0;
+                rack_filter();
+            } else ui.confirmDel = slot + 1;
+        } else load_preset(slot);
+        return;
+    }
+    ui.confirmDel = 0;
+}
+
+static Rectangle box_rect(Vector2 a, Vector2 b)
+{
+    return (Rectangle){ fminf(a.x, b.x), fminf(a.y, b.y), fabsf(a.x - b.x), fabsf(a.y - b.y) };
+}
 
 static void handle_input(void)
 {
     Vector2 mp = GetMousePosition();
     bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    bool cmd = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL) || IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
+
+    if (ui.modal) { modal_input(mp); ui.last = mp; return; }
 
     if (ui.menu) {
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
-            for (int i = 0; i < M_COUNT; i++)
-                if (CheckCollisionPointRec(mp, menu_item(i)) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
-                    add_module(MENU_ORDER[i], ui.menuPos.x - pan.x, ui.menuPos.y - pan.y);
+            bool left = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
             ui.menu = false;
+            for (int i = 0; i < M_COUNT; i++)
+                if (left && CheckCollisionPointRec(mp, menu_item(i)))
+                    add_module(MENU_ORDER[i], ui.menuPos.x - pan.x, ui.menuPos.y - pan.y);
+            if (left && CheckCollisionPointRec(mp, menu_item(M_COUNT))) open_rack(true, ui.menuPos);
         }
         if (IsKeyPressed(KEY_ESCAPE)) ui.menu = false;
         return;
     }
 
+    // keyboard
+    if (IsKeyPressed(KEY_P) && !cmd) { open_rack(false, mp); return; }
+    if (IsKeyPressed(KEY_S) && !cmd) { open_save(); return; }
+    if (cmd && IsKeyPressed(KEY_A)) for (int i = 0; i < MAX_MODULES; i++) sel[i] = mods[i].alive;
+    if (IsKeyPressed(KEY_ESCAPE)) select_none();
+
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         int pm, pi; bool po;
         int ki, kk;
         int mi = module_at(mp);
+        ui.press = mp;
+        if (CheckCollisionPointRec(mp, btn_rack())) { open_rack(false, mp); return; }
+        if (selection_count() && CheckCollisionPointRec(mp, btn_save())) { open_save(); return; }
         if (find_port(mp, &pm, &pi, &po)) {
             ui.mode = D_CABLE;
             if (po) { ui.mod = pm; ui.idx = pi; ui.fromOut = true; ui.color = next_color++ % N_CABLE_COLORS; }
@@ -1211,9 +1878,15 @@ static void handle_input(void)
         } else if (mi >= 0) {
             const ModDef *d = &DEFS[mods[mi].type];
             if (d->press && d->press(&mods[mi], mp, custom_rect(&mods[mi]))) { ui.mode = D_CUSTOM; ui.mod = mi; }
-            else if (mp.y < mods[mi].pos.y + pan.y + HEADER_H) { ui.mode = D_MODULE; ui.mod = mi; }
+            else if (mp.y < mods[mi].pos.y + pan.y + HEADER_H) {
+                if (shift) { sel[mi] = !sel[mi]; ui.mode = D_NONE; }
+                else {
+                    if (!sel[mi]) { select_none(); sel[mi] = true; }
+                    ui.mode = D_MODULE; ui.mod = mi;
+                }
+            }
             else ui.mode = D_NONE;
-        } else ui.mode = D_PAN;
+        } else ui.mode = shift ? D_BOX : D_PAN;
         ui.last = mp;
     }
 
@@ -1227,7 +1900,7 @@ static void handle_input(void)
         } else if (module_at(mp) < 0) {
             ui.menu = true;
             ui.menuPos = mp;
-            float maxY = GetScreenHeight() - 30 - M_COUNT * MENU_ITEM_H;
+            float maxY = GetScreenHeight() - 40 - MENU_N * MENU_ITEM_H;
             if (ui.menuPos.y > maxY) ui.menuPos.y = maxY;
             if (ui.menuPos.x > GetScreenWidth() - MENU_W - 4) ui.menuPos.x = GetScreenWidth() - MENU_W - 4;
         }
@@ -1236,7 +1909,10 @@ static void handle_input(void)
     Vector2 delta = { mp.x - ui.last.x, mp.y - ui.last.y };
     if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
         switch (ui.mode) {
-        case D_MODULE: mods[ui.mod].pos.x += delta.x; mods[ui.mod].pos.y += delta.y; break;
+        case D_MODULE:
+            for (int i = 0; i < MAX_MODULES; i++)
+                if (mods[i].alive && sel[i]) { mods[i].pos.x += delta.x; mods[i].pos.y += delta.y; }
+            break;
         case D_PAN:    pan.x += delta.x; pan.y += delta.y; break;
         case D_KNOB: {
             const KnobDef *kd = &DEFS[mods[ui.mod].type].knobs[ui.idx];
@@ -1257,6 +1933,12 @@ static void handle_input(void)
                 if (ui.fromOut) add_cable(ui.mod, ui.idx, pm, pi, ui.color);
                 else            add_cable(pm, pi, ui.mod, ui.idx, ui.color);
             }
+        } else if (ui.mode == D_BOX) {
+            Rectangle b = box_rect(ui.press, mp);
+            for (int i = 0; i < MAX_MODULES; i++)
+                if (mods[i].alive && CheckCollisionRecs(b, module_rect(&mods[i]))) sel[i] = true;
+        } else if (ui.mode == D_PAN && hypotf(mp.x - ui.press.x, mp.y - ui.press.y) < 4) {
+            select_none();   // a plain click on empty space
         }
         ui.mode = D_NONE;
     }
@@ -1274,6 +1956,106 @@ static void handle_input(void)
 }
 
 // ---------------------------------------------------------------------------
+// Overlays: buttons, rack picker, save dialog, toast
+// ---------------------------------------------------------------------------
+
+static void draw_button(Rectangle r, const char *label, Vector2 mp, bool accent)
+{
+    bool h = CheckCollisionPointRec(mp, r);
+    DrawRectangleRec(r, h ? PANEL_HI : PANEL);
+    DrawRectangleLinesEx(r, 1, h || accent ? ACCENT_DIM : PANEL_HI);
+    txt_c(label, r.x + r.width / 2, r.y + r.height / 2 - 5, 10, h || accent ? ACCENT : TEXT);
+}
+
+static void draw_field(Rectangle r, const char *text, const char *placeholder)
+{
+    DrawRectangleRec(r, INSET);
+    DrawRectangleLinesEx(r, 1, ACCENT_DIM);
+    float x = r.x + 10, y = r.y + r.height / 2 - 6;
+    if (text[0]) txt(text, x, y, 12, TEXT);
+    else txt(placeholder, x, y, 12, fade(TEXT_DIM, 0.7f));
+    if (fmodf((float)GetTime(), 1.0f) < 0.6f) {
+        float cx = x + (text[0] ? txt_w(text, 12) + 2 : 0);
+        DrawRectangle((int)cx, (int)y - 2, 2, 16, ACCENT);
+    }
+}
+
+static void draw_dialog_frame(Rectangle b, const char *title)
+{
+    DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), (Color){ 2, 6, 6, 150 });
+    DrawRectangleRec((Rectangle){ b.x + 8, b.y + 10, b.width, b.height }, (Color){ 0, 0, 0, 120 });
+    DrawRectangleGradientH((int)b.x - CHEEK, (int)b.y, CHEEK, (int)b.height, WOOD_DARK, WOOD);
+    DrawRectangleGradientH((int)(b.x + b.width), (int)b.y, CHEEK, (int)b.height, WOOD, WOOD_DARK);
+    DrawRectangleRec(b, PANEL);
+    DrawRectangleRec((Rectangle){ b.x, b.y, b.width, 30 }, (Color){ 33, 35, 37, 255 });
+    txt(title, b.x + 16, b.y + 10, 10, TEXT);
+}
+
+static void draw_rack(Vector2 mp)
+{
+    Rectangle b = rack_box();
+    draw_dialog_frame(b, "PRESET RACK");
+    const char *count = TextFormat("%d / %d", rack_count, PRESET_MAX);
+    txt(count, b.x + b.width - 16 - txt_w(count, 10), b.y + 10, 10, TEXT_DIM);
+    draw_field(rack_search(), ui.text, "SEARCH BY NAME, NUMBER OR MODULE");
+
+    Rectangle l = rack_list();
+    DrawRectangleRec(l, INSET);
+    rack_filter();
+    if (!rack_ready) txt("LOADING PRESETS...", l.x + 12, l.y + 10, 10, TEXT_DIM);
+    else if (!nfilt) txt(rack_count ? "NO PRESET MATCHES" : "THE RACK IS EMPTY: SELECT MODULES AND PRESS S TO SAVE ONE", l.x + 12, l.y + 10, 10, TEXT_DIM);
+    int vis = rack_visible();
+    ui.scroll = clampi(ui.scroll, 0, nfilt > vis ? nfilt - vis : 0);
+    for (int v = 0; v < vis && ui.scroll + v < nfilt; v++) {
+        int fi = ui.scroll + v, slot = filt[fi];
+        Rectangle row = rack_row(v);
+        bool hover = CheckCollisionPointRec(mp, row);
+        if (fi == ui.hl || hover) DrawRectangleRec(row, fade(ACCENT, fi == ui.hl ? 0.12f : 0.06f));
+        if (fi == ui.hl) DrawRectangle((int)row.x, (int)row.y, 2, (int)row.height, ACCENT);
+        txt(preset_label(slot), row.x + 12, row.y + 9, 12, fi == ui.hl ? ACCENT : TEXT);
+        Rectangle del = rack_del(row);
+        bool armed = ui.confirmDel == slot + 1;
+        char sum[100];
+        snprintf(sum, sizeof sum, "%s", armed ? "CLICK X AGAIN TO DELETE" : rack[slot].summary);
+        float maxw = del.x - 12 - (row.x + 24 + txt_w(preset_label(slot), 12));
+        for (int n = (int)strlen(sum); n > 3 && txt_w(sum, 10) > maxw; n--) strcpy(sum + n - 4, "...");
+        float sw = txt_w(sum, 10);
+        if (sw <= maxw) txt(sum, del.x - 12 - sw, row.y + 10, 10, armed ? CABLE_COLORS[1] : TEXT_DIM);
+        if (hover || armed) {
+            bool hd = CheckCollisionPointRec(mp, del);
+            txt_c("x", del.x + del.width / 2, del.y + 3, 10, hd || armed ? CABLE_COLORS[1] : TEXT_DIM);
+        }
+    }
+    if (nfilt > vis) {   // scrollbar
+        float th = l.height * vis / nfilt, ty = l.y + (l.height - th) * ui.scroll / (float)(nfilt - vis);
+        DrawRectangle((int)(l.x + l.width - 3), (int)ty, 2, (int)th, ACCENT_DIM);
+    }
+    txt(ui.placeAt ? "ENTER / CLICK: LOAD HERE    UP/DOWN: SELECT    ESC: CLOSE"
+                   : "ENTER / CLICK: LOAD    UP/DOWN: SELECT    ESC: CLOSE",
+        b.x + 16, b.y + b.height - 24, 10, TEXT_DIM);
+}
+
+static void draw_save(Vector2 mp)
+{
+    Rectangle b = save_box();
+    draw_dialog_frame(b, "SAVE PRESET");
+    int nm = selection_count(), nc = 0;
+    for (int c = 0; c < ncables; c++) nc += sel[cables[c].fm] && sel[cables[c].tm];
+    txt(TextFormat("%d MODULE%s, %d CABLE%s", nm, nm == 1 ? "" : "S", nc, nc == 1 ? "" : "S"), b.x + 16, b.y + 40, 10, TEXT_DIM);
+    draw_field(save_field(), ui.text, "NAME, E.G. MY PAD OSCILLATOR");
+    int slot = next_free_slot();
+    if (slot >= PRESET_MAX) txt(TextFormat("THE RACK IS FULL (%d PRESETS)", PRESET_MAX), b.x + 16, b.y + 100, 10, CABLE_COLORS[1]);
+    else if (ui.text[0]) {
+        char slug[PRESET_NAME_MAX + 1];
+        make_slug(ui.text, slug);
+        txt("STORED AS", b.x + 16, b.y + 102, 10, TEXT_DIM);
+        txt(TextFormat("#%d-%s", slot + 1, slug), b.x + 16 + txt_w("STORED AS", 10) + 10, b.y + 100, 12, ACCENT);
+    }
+    draw_button(save_cancel(), "CANCEL", mp, false);
+    draw_button(save_ok(), "SAVE", mp, ui.text[0] != 0);
+}
+
+// ---------------------------------------------------------------------------
 // Frame
 // ---------------------------------------------------------------------------
 
@@ -1288,20 +2070,27 @@ static void frame(void)
         SetWindowSize(syncW, syncH);
     }
 #endif
+    if (!rack_ready && fs_ready()) rack_load();
     handle_input();
     Vector2 mp = GetMousePosition();
+    bool overlay = ui.modal || ui.menu;
 
-    int hoverMod = module_at(mp), hoverKnob = -1, km, kk;
-    if (knob_at(mp, &km, &kk) && km == hoverMod) hoverKnob = kk;
+    int hoverMod = overlay ? -1 : module_at(mp), hoverKnob = -1, km, kk;
+    if (!overlay && knob_at(mp, &km, &kk) && km == hoverMod) hoverKnob = kk;
     int hpMod = -1, hpIdx = -1; bool hpOut = false;
-    find_port(mp, &hpMod, &hpIdx, &hpOut);
+    if (!overlay) find_port(mp, &hpMod, &hpIdx, &hpOut);
 
     BeginDrawing();
     draw_background((float)GetTime());
 
     for (int i = 0; i < MAX_MODULES; i++)
-        if (mods[i].alive)
+        if (mods[i].alive) {
             draw_module(i, hoverMod, hoverKnob, (ui.mode == D_KNOB && ui.mod == i) ? ui.idx : -1, hpMod, hpIdx, hpOut);
+            if (sel[i]) {
+                Rectangle r = module_rect(&mods[i]);
+                DrawRectangleLinesEx((Rectangle){ r.x - 3, r.y - 3, r.width + 6, r.height + 6 }, 1.5f, ACCENT);
+            }
+        }
 
     for (int c = 0; c < ncables; c++) {
         Cable *k = &cables[c];
@@ -1311,52 +2100,56 @@ static void frame(void)
         Vector2 a = port_pos(&mods[ui.mod], ui.fromOut, ui.idx);
         draw_cable(a, mp, CABLE_COLORS[ui.color], 0.75f);
     }
+    if (ui.mode == D_BOX) {
+        Rectangle b = box_rect(ui.press, mp);
+        DrawRectangleRec(b, fade(ACCENT, 0.06f));
+        DrawRectangleLinesEx(b, 1, fade(ACCENT, 0.7f));
+    }
 
-    // brand + hints
+    // brand, buttons, hints
     txt("R A Y A", 18, 14, 20, TEXT);
     txt("AMBIENT MODULAR", 18, 38, 10, TEXT_DIM);
-    txt("DRAG JACK TO JACK TO PATCH   RIGHT-CLICK JACK: UNPLUG   RIGHT-CLICK SPACE: ADD MODULE   DRAG SPACE: PAN   DOUBLE-CLICK KNOB: RESET   SHIFT: FINE",
+    Vector2 bmp = overlay ? (Vector2){ -1, -1 } : mp;
+    draw_button(btn_rack(), TextFormat("PRESET RACK  %d", rack_count), bmp, false);
+    int ns = selection_count();
+    if (ns) draw_button(btn_save(), TextFormat("SAVE %d MODULE%s AS PRESET", ns, ns == 1 ? "" : "S"), bmp, true);
+    txt("DRAG JACK TO JACK: PATCH   RIGHT-CLICK JACK: UNPLUG   RIGHT-CLICK SPACE: ADD   DRAG SPACE: PAN   SHIFT-DRAG SPACE: SELECT   P: PRESETS   S: SAVE SELECTION   DOUBLE-CLICK KNOB: RESET",
         18, GetScreenHeight() - 22, 10, fade(TEXT_DIM, 0.8f));
 
     if (ui.menu) {
-        Rectangle box = { ui.menuPos.x, ui.menuPos.y, MENU_W, 30 + M_COUNT * MENU_ITEM_H };
+        Rectangle box = { ui.menuPos.x, ui.menuPos.y, MENU_W, 38 + MENU_N * MENU_ITEM_H };
         DrawRectangleRec((Rectangle){ box.x + 5, box.y + 6, box.width, box.height }, (Color){ 0, 0, 0, 110 });
         DrawRectangleRec(box, PANEL);
         DrawRectangleLinesEx(box, 1, PANEL_HI);
         txt("ADD MODULE", box.x + 10, box.y + 9, 10, TEXT_DIM);
-        for (int i = 0; i < M_COUNT; i++) {
+        for (int i = 0; i < MENU_N; i++) {
             Rectangle it = menu_item(i);
             bool h = CheckCollisionPointRec(mp, it);
+            if (i == M_COUNT) DrawLineEx((Vector2){ it.x + 8, it.y - 4 }, (Vector2){ it.x + it.width - 8, it.y - 4 }, 1, PANEL_HI);
             if (h) DrawRectangleRec(it, fade(ACCENT, 0.12f));
-            txt(DEFS[MENU_ORDER[i]].name, it.x + 12, it.y + 7, 10, h ? ACCENT : TEXT);
+            txt(i < M_COUNT ? DEFS[MENU_ORDER[i]].name : "PRESET RACK...", it.x + 12, it.y + 7, 10, h ? ACCENT : TEXT);
         }
+    }
+    if (ui.modal == MODAL_RACK) draw_rack(mp);
+    if (ui.modal == MODAL_SAVE) draw_save(mp);
+
+    float ta = 1.0f - (float)(GetTime() - ui.toastT - 2.0) / 0.6f;
+    if (ta > 0) {
+        float w = txt_w(ui.toast, 10) + 32, x = (GetScreenWidth() - w) / 2, y = GetScreenHeight() - 62.0f;
+        DrawRectangleRec((Rectangle){ x, y, w, 26 }, fade(PANEL, ta));
+        DrawRectangleLinesEx((Rectangle){ x, y, w, 26 }, 1, fade(ACCENT_DIM, ta));
+        txt(ui.toast, x + 16, y + 8, 10, fade(ACCENT, ta));
     }
     EndDrawing();
 }
 
+// The startup patch is factory preset #1.
 static void default_layout(void)
 {
-    int clk = add_module(M_CLOCK,  24,  70);
-    int lfo = add_module(M_LFO,    24, 270);
-    int seq = add_module(M_SEQ,   276,  70);
-    int chd = add_module(M_CHORD, 684,  70);
-    int osc = add_module(M_OSC3,  276, 360);
-    int rev = add_module(M_REVERB, 708, 360);
-    int out = add_module(M_OUT,   964, 360);
-
-    /* A starting patch that sounds right away: a drifting chord pad through
-       the reverb. Every cable can be pulled out and repatched. */
-    add_cable(clk, 0, seq, 0, 3);   /* 1/16 -> SEQ CLOCK      */
-    add_cable(clk, 2, chd, 0, 0);   /* BAR  -> CHORDS CLOCK   */
-    add_cable(chd, 0, osc, 0, 1);   /* N1..N3 -> P1..P3       */
-    add_cable(chd, 1, osc, 1, 1);
-    add_cable(chd, 2, osc, 2, 1);
-    add_cable(seq, 1, osc, 5, 3);   /* SEQ CV -> WAVE         */
-    add_cable(lfo, 0, osc, 4, 2);   /* SINE -> CUTOFF         */
-    add_cable(osc, 0, rev, 0, 4);   /* OSC -> REVERB -> OUT   */
-    add_cable(osc, 1, rev, 1, 4);
-    add_cable(rev, 0, out, 0, 0);
-    add_cable(rev, 1, out, 1, 0);
+    char *text = factory_text(0);
+    preset_instantiate(text, (Vector2){ 24, 70 });
+    free(text);
+    select_none();
 }
 
 int main(void)
@@ -1366,6 +2159,14 @@ int main(void)
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(1280, 760, "raya");
     SetExitKey(KEY_NULL);
+
+#if defined(PLATFORM_WEB)
+    // Presets live in IndexedDB; mount it and pull its contents in before use.
+    emscripten_run_script(
+        "try { FS.mkdir('" PRESET_ROOT "'); FS.mount(IDBFS, {}, '" PRESET_ROOT "');"
+        "  FS.syncfs(true, function (e) { if (e) console.error('raya: preset load failed', e); Module.rayaFsReady = 1; }); }"
+        "catch (e) { console.error('raya: no preset storage', e); Module.rayaFsReady = 1; }");
+#endif
 
     default_layout();
     rebuild_routing();
