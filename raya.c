@@ -1,6 +1,13 @@
 // raya — ambient modular synth environment
 // Single file, C99, raylib. Build for the web with `make`, see Makefile.
 //
+// Copyright (C) 2026 Jan Wollschlaeger
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// This program is free software: you can redistribute it and/or modify it under
+// the terms of the GNU Lesser General Public License as published by the Free
+// Software Foundation, either version 2.1 of the License, or (at your option)
+// any later version. See LICENSE and THIRD-PARTY-NOTICES.md.
+//
 // Signal conventions (all cables carry one float per sample):
 //   audio  : roughly -1..1
 //   gate   : 0 or 1, rising edge = trigger
@@ -1774,7 +1781,7 @@ static void voice_run(Voice *v, float *L, float *R, float decayTau)
 
 // ---------------------------------------------------------------------------
 // Drum synthesis — every kit is rendered from the same small set of circuit-
-// style generators (pitch-swept sines, tuned noise, the 808's six square
+// style generators (pitch-swept sines, tuned noise, six detuned square
 // oscillators, inharmonic partials, a chip LFSR), then given its character:
 // sample rate, bit depth, 8-bit companding, saturation, tape and vinyl.
 //
@@ -1782,7 +1789,7 @@ static void voice_run(Voice *v, float *L, float *R, float decayTau)
 // descriptions of each machine's hardware characteristics. They are clean-room
 // reimplementations: nothing was sampled from real hardware or taken from any
 // recording or sample set; they only approximate how such drum kits sound.
-// Kit names describe the style being approximated.
+// Kit names are raya's own; raya is not affiliated with any manufacturer.
 // ---------------------------------------------------------------------------
 
 enum { BQ_LP, BQ_HP, BQ_BP };
@@ -1830,7 +1837,7 @@ static float lfsr(Lfsr *l, int period, bool shortMode)
     return l->out;
 }
 
-enum { MT_808, MT_NOISE, MT_CHIP };                                   // hats and cymbals
+enum { MT_SQUARE, MT_NOISE, MT_CHIP };                                   // hats and cymbals
 enum { TM_ANALOG, TM_ACOUSTIC, TM_SIMMONS, TM_CHIP, TM_MALLET };       // toms
 enum { BL_COWBELL, BL_CLAVE, BL_BLOCK, BL_TRIANGLE, BL_CHIP, BL_BAR }; // pad 14
 enum { PC_CONGA, PC_TAMB, PC_GUIRO, PC_BONGO, PC_ZAP, PC_BOWL };       // pad 16
@@ -1857,59 +1864,59 @@ typedef struct {
 } KitDef;
 
 static const KitDef KITS[] = {
-    { "808",
+    { "BOOMER",
       { { 98, 49, 0.035f, 0.42f, 0.25f }, { 125, 56, 0.022f, 0.12f, 0.35f } },
       { { 185, 330, 0.056f, 0.072f, 0.55f, 9000, 0 }, { 200, 350, 0.04f, 0.11f, 0.72f, 11000, 0 } },
-      { 1050, 0.08f }, { 1700, 455 }, MT_808, { 0.029f, 0.171f, 6300 }, { 0.44f, 0.36f },
+      { 1050, 0.08f }, { 1700, 455 }, MT_SQUARE, { 0.029f, 0.171f, 6300 }, { 0.44f, 0.36f },
       TM_ANALOG, { 95, 1.18f, 0.16f }, BL_COWBELL, PC_CONGA, { 5000, 0.001f, 0.028f } },
-    { "909",
+    { "PUNCHY",
       { { 260, 53, 0.032f, 0.18f, 0.7f }, { 300, 60, 0.025f, 0.098f, 0.9f } },
       { { 190, 345, 0.048f, 0.094f, 0.62f, 12000, 0 }, { 205, 360, 0.036f, 0.132f, 0.78f, 14000, 0 } },
       { 1200, 0.09f }, { 1850, 500 }, MT_NOISE, { 0.033f, 0.189f, 7500 }, { 0.64f, 0.84f },
       TM_ANALOG, { 105, 1.35f, 0.14f }, BL_COWBELL, PC_TAMB, { 5500, 0.001f, 0.03f },
       .drive = 0.15f, .metalBits = 6 },
-    { "707",
+    { "CRISP",
       { { 170, 58, 0.02f, 0.098f, 0.5f }, { 200, 62, 0.015f, 0.068f, 0.6f } },
       { { 210, 360, 0.04f, 0.077f, 0.65f, 8000, 0 }, { 230, 380, 0.032f, 0.055f, 0.75f, 9000, 0 } },
       { 1300, 0.06f }, { 1600, 520 }, MT_NOISE, { 0.026f, 0.135f, 7000 }, { 0.4f, 0.72f },
       TM_ACOUSTIC, { 110, 1.1f, 0.125f }, BL_COWBELL, PC_TAMB, { 6000, 0.002f, 0.035f },
       .lp = 10000, .rate = 25000, .bits = 8 },
-    { "606",
+    { "TINY",
       { { 150, 62, 0.015f, 0.083f, 0.2f }, { 175, 68, 0.012f, 0.053f, 0.3f } },
       { { 220, 400, 0.032f, 0.055f, 0.78f, 10000, 0 }, { 240, 420, 0.028f, 0.077f, 0.85f, 12000, 0 } },
-      { 1150, 0.065f }, { 1900, 600 }, MT_808, { 0.023f, 0.113f, 7500 }, { 0.32f, 0.3f },
+      { 1150, 0.065f }, { 1900, 600 }, MT_SQUARE, { 0.023f, 0.113f, 7500 }, { 0.32f, 0.3f },
       TM_ANALOG, { 120, 1.12f, 0.1f }, BL_CLAVE, PC_CONGA, { 6500, 0.001f, 0.02f } },
-    { "CR-78",
+    { "PARLOR",
       { { 80, 68, 0.02f, 0.064f, 0.05f }, { 95, 75, 0.015f, 0.045f, 0.08f } },
       { { 240, 450, 0.024f, 0.039f, 0.8f, 7000, 0 }, { 260, 470, 0.02f, 0.055f, 0.85f, 8000, 0 } },
-      { 900, 0.05f }, { 1500, 420 }, MT_808, { 0.019f, 0.09f, 8000 }, { 0.36f, 0.3f },
+      { 900, 0.05f }, { 1500, 420 }, MT_SQUARE, { 0.019f, 0.09f, 8000 }, { 0.36f, 0.3f },
       TM_ANALOG, { 140, 1.05f, 0.075f }, BL_CLAVE, PC_GUIRO, { 4500, 0.001f, 0.03f },
       .lp = 9000, .hiss = 0.15f },
-    { "303 GROOVE",
+    { "GROOVEBOX",
       { { 200, 52, 0.03f, 0.225f, 0.6f }, { 140, 48, 0.03f, 0.375f, 0.3f } },
       { { 195, 340, 0.048f, 0.088f, 0.66f, 11000, 0 }, { 180, 330, 0.056f, 0.066f, 0.55f, 9000, 0 } },
-      { 1150, 0.1f }, { 1750, 470 }, MT_808, { 0.029f, 0.158f, 6800 }, { 0.52f, 0.48f },
+      { 1150, 0.1f }, { 1750, 470 }, MT_SQUARE, { 0.029f, 0.158f, 6800 }, { 0.52f, 0.48f },
       TM_ANALOG, { 100, 1.25f, 0.15f }, BL_COWBELL, PC_CONGA, { 5500, 0.001f, 0.03f },
       .lp = 14000, .drive = 0.35f },
-    { "404 DUST",
+    { "DUSTY",
       { { 120, 50, 0.03f, 0.188f, 0.4f }, { 160, 56, 0.02f, 0.112f, 0.5f } },
       { { 200, 330, 0.048f, 0.11f, 0.6f, 6500, 0 }, { 180, 300, 0.056f, 0.099f, 0.5f, 5000, 0.003f } },
       { 950, 0.11f }, { 1400, 400 }, MT_NOISE, { 0.033f, 0.158f, 6000 }, { 0.64f, 0.72f },
       TM_ACOUSTIC, { 95, 1.1f, 0.15f }, BL_BLOCK, PC_BONGO, { 4500, 0.008f, 0.06f },
       .lp = 7000, .rate = 24000, .drive = 0.45f, .hiss = 0.3f, .bits = 12 },
-    { "LM DRUM",
+    { "POP 80",
       { { 110, 58, 0.025f, 0.12f, 0.45f }, { 130, 62, 0.02f, 0.083f, 0.55f } },
       { { 195, 320, 0.056f, 0.105f, 0.62f, 8500, 0 }, { 215, 350, 0.04f, 0.077f, 0.7f, 9500, 0 } },
       { 1100, 0.09f }, { 1650, 380 }, MT_NOISE, { 0.039f, 0.225f, 7000 }, { 0.72f, 0.96f },
       TM_ACOUSTIC, { 90, 1.12f, 0.175f }, BL_COWBELL, PC_CONGA, { 5000, 0.004f, 0.05f },
       .lp = 11000, .rate = 28000, .bits = 8, .mulaw = true },
-    { "DMX",
+    { "BREAKER",
       { { 130, 55, 0.03f, 0.143f, 0.6f }, { 150, 60, 0.02f, 0.09f, 0.7f } },
       { { 185, 300, 0.064f, 0.11f, 0.58f, 9000, 0 }, { 200, 320, 0.048f, 0.083f, 0.66f, 10000, 0 } },
       { 1250, 0.085f }, { 1700, 480 }, MT_NOISE, { 0.033f, 0.203f, 7500 }, { 0.8f, 0.9f },
       TM_ACOUSTIC, { 85, 1.15f, 0.2f }, BL_COWBELL, PC_TAMB, { 5500, 0.003f, 0.045f },
       .rate = 26000, .drive = 0.2f, .bits = 8, .mulaw = true },
-    { "SDS-V",
+    { "HEXAGON",
       { { 160, 50, 0.06f, 0.225f, 0.3f }, { 220, 55, 0.08f, 0.165f, 0.4f } },
       { { 210, 330, 0.08f, 0.121f, 0.55f, 8000, 0 }, { 250, 380, 0.064f, 0.165f, 0.62f, 10000, 0 } },
       { 1000, 0.1f }, { 1200, 400 }, MT_NOISE, { 0.033f, 0.18f, 7000 }, { 0.72f, 0.78f },
@@ -2013,17 +2020,17 @@ static void dr_rim(float hi, float lo, float *y, int n)
     }
 }
 
-// The 808's metal: six square oscillators, band-passed.
-static const float M808[6] = { 205.3f, 304.4f, 369.6f, 522.7f, 540.0f, 800.0f };
+// Classic analog metal: six detuned square oscillators, band-passed.
+static const float SQ_METAL[6] = { 205.3f, 304.4f, 369.6f, 522.7f, 540.0f, 800.0f };
 
-static void dr_metal808(float dec, float hp, bool cymbal, float *y, int n)
+static void dr_metal_square(float dec, float hp, bool cymbal, float *y, int n)
 {
     double ph[6] = { 0 };
     Biquad hiBand = bq_make(BQ_BP, 7100, 1.0f), loBand = bq_make(BQ_BP, 3440, 1.2f);
     Biquad h1 = bq_make(BQ_HP, hp, 0.7f), h2 = bq_make(BQ_HP, hp, 0.7f);
     for (int i = 0; i < n; i++) {
         float t = i / SR, x = 0;
-        for (int k = 0; k < 6; k++) { ph[k] += M808[k] / SR; x += fractf((float)ph[k]) < 0.5f ? 1.0f : -1.0f; }
+        for (int k = 0; k < 6; k++) { ph[k] += SQ_METAL[k] / SR; x += fractf((float)ph[k]) < 0.5f ? 1.0f : -1.0f; }
         x /= 6;
         float hi = bq(&h2, bq(&h1, bq(&hiBand, x))) * env_ad(t, 0.0005f, dec);
         float lo = cymbal ? bq(&loBand, x) * 0.6f * env_ad(t, 0.0005f, dec * 0.3f) : 0;
@@ -2094,7 +2101,7 @@ static void dr_tom(int type, float f, float drop, float dec, float *y, int n)
             x = sinf(TAU * (float)ph) * env_ad(t, 0.0008f, dec) + 0.35f * sinf(TAU * (float)ph2) * env_ad(t, 0.0008f, dec * 0.4f)
               + 0.25f * bq(&hp, dr_noise()) * expf(-t / 0.012f);
             break;
-        default:           // 808-style: a resonator with a little pitch drop and skin noise
+        default:           // analog: a resonator with a little pitch drop and skin noise
             ft = f * (1 + (drop - 1) * expf(-t / 0.03f));
             ph += ft / SR;
             x = sinf(TAU * (float)ph) * env_ad(t, 0.0008f, dec) + 0.08f * bq(&lp, dr_noise()) * expf(-t / (dec * 0.5f));
@@ -2110,7 +2117,7 @@ static void dr_bell(int type, float *y, int n)
     for (int i = 0; i < n; i++) {
         float t = i / SR, x = 0;
         switch (type) {
-        case BL_COWBELL:   // the 808 cowbell: squares at 540 and 800 Hz
+        case BL_COWBELL:   // analog cowbell: squares at 540 and 800 Hz
             p[0] += 540 / SR; p[1] += 800 / SR;
             x = (fractf((float)p[0]) < 0.5f ? 1.0f : -1.0f) + (fractf((float)p[1]) < 0.5f ? 1.0f : -1.0f);
             x = bq(&bp, x * 0.5f) * (0.7f * expf(-t / 0.015f) + 0.3f * expf(-t / 0.25f)) * 2.5f;
@@ -2152,7 +2159,7 @@ static void dr_perc(int type, float *y, int n)
     for (int i = 0; i < n; i++) {
         float t = i / SR, x = 0;
         switch (type) {
-        case PC_CONGA:     // 808 conga: the tom circuit, tuned high
+        case PC_CONGA:     // analog conga: the tom circuit, tuned high
             ph += 330 * (1 + 0.06f * expf(-t / 0.02f)) / SR;
             x = sinf(TAU * (float)ph) * env_ad(t, 0.0008f, 0.16f);
             break;
@@ -2241,13 +2248,13 @@ static void kit_render_slot(int ki, int slot)
         case 5:          dr_rim(k->rim[0], k->rim[1], y, n); break;
         case 6: case 7: {
             float dec = k->hat[slot - 6];
-            if (k->metal == MT_808) dr_metal808(dec, k->hat[2], false, y, n);
+            if (k->metal == MT_SQUARE) dr_metal_square(dec, k->hat[2], false, y, n);
             else if (k->metal == MT_CHIP) dr_metal_chip(dec, slot == 7 ? 2 : 1, slot == 6, y, n);
             else dr_metal_noise(dec, k->hat[2], 24, 3000, 14000, 0.5f, 0.0005f, y, n);
         } break;
         case 8: case 9: {
             float dec = k->cym[slot - 8];
-            if (k->metal == MT_808) dr_metal808(dec, k->hat[2] * (slot == 9 ? 1.1f : 0.8f), slot == 8, y, n);
+            if (k->metal == MT_SQUARE) dr_metal_square(dec, k->hat[2] * (slot == 9 ? 1.1f : 0.8f), slot == 8, y, n);
             else if (k->metal == MT_CHIP) dr_metal_chip(dec, slot == 8 ? 3 : 2, slot == 9, y, n);
             else if (slot == 8) dr_metal_noise(dec, 2500, 40, 400, 11000, 0.45f, 0.004f, y, n);
             else {   // ride: a quieter wash plus the bell's ping
@@ -3805,7 +3812,7 @@ static const struct { const char *name, *body; } FACTORY[] = {
       "cable 0 0 1 0 3\ncable 1 0 3 0 2\ncable 1 0 3 1 2\ncable 1 0 3 2 2\ncable 1 1 3 3 3\n"
       "cable 3 0 4 0 4\ncable 3 1 4 1 4\ncable 4 0 5 0 0\ncable 4 1 5 1 0\n"
       "cable 2 0 5 0 1\ncable 2 1 5 1 1\ncable 5 0 6 0 0\ncable 5 1 6 1 0\n" },
-    { "808 groove",
+    { "boomer groove",
       "module clock 0 0\nknob BPM 84\n"
       "module seq 256 0\nknob CHANCE 1\nknob GLIDE 0\ndata 1:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500\n"
       "module seq 668 0\nknob CHANCE 1\nknob GLIDE 0\ndata 0:0.500 0:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500\n"

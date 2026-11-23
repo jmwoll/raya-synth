@@ -81,33 +81,53 @@ ARRANGER turns a looping patch into a song. Feed it the CLOCK's 1/16 output and 
 
 The factory preset *electro 128* is a rough reproduction of a 128 BPM electro-house track:
 - **Structure:** 11 sections over 232 bars, mapped from an analysis of the track: intro, beat, drop-out, breakdown, drop, hat wash, deep groove, an electro-break return and the outro.
-- **Drums and bass:** a 909 kick, clap, hats and shaker, plus a rolling bass built from the chord root and a sequencer.
+- **Drums and bass:** the PUNCHY kit (kick, clap, hats and shaker), plus a rolling bass built from the chord root and a sequencer.
 - **Synths:** a chorused pad whose FILTER opens with the arranger's LEVEL, and an arpeggiated lead with a dotted-8th tape echo.
 
 ## Drums
 
-DRUMS has 16 pads, each with its own trigger input: two kicks (BD1, BD2), two snares, clap, rim, closed and open hi-hat, crash, ride, three toms, plus a bell, a shaker and one percussion sound (cowbell, clave, conga, tambourine and so on, depending on the kit). Click a pad to hear it; the closed hat cuts off the open one, as on the original machines.
+DRUMS has 16 pads, each with its own trigger input: two kicks (BD1, BD2), two snares, clap, rim, closed and open hi-hat, crash, ride, three toms, plus a bell, a shaker and one percussion sound (cowbell, clave, conga, tambourine and so on, depending on the kit). Click a pad to hear it; the closed hat cuts off the open one, as on classic drum machines.
 
-There are 16 kits: **808, 909, 707, 606, CR-78, 303 GROOVE, 404 DUST, LM DRUM, DMX, SDS-V, STUDIO, BRUSHES, TAPE LOFI, VINYL, 8-BIT** and **FELT**.
+There are 16 kits, loosely inspired by classic drum machines and recording styles:
 
-- **How they're made:** all kits are synthesized the way the originals worked, not stored as recordings. Examples:
-  - the 808's pitch-swept sine kick, its two-tone snare, and hats and cymbals from its six square oscillators;
-  - the 909's sweeping kick, with 6-bit cymbals;
-  - the 8-bit companded samples of the LM-1 and DMX;
-  - the Simmons tom sweep;
+| Kit | Character |
+| --- | --- |
+| BOOMER | Classic analog: long boomy kick, two-tone snare, square-wave metallic hats |
+| PUNCHY | Analog kick and snare with a fast pitch sweep, gritty 6-bit cymbals |
+| CRISP | Early 8-bit sampled kit, short and bright |
+| TINY | Small analog box: thin and snappy |
+| PARLOR | Vintage home rhythm box: soft kick, guiro, clave |
+| GROOVEBOX | Punchy hybrid analog kit with drive |
+| DUSTY | Lo-fi sampler grit: 12-bit, low sample rate, saturated |
+| POP 80 | Early-80s companded 8-bit studio drums |
+| BREAKER | Punchy 80s 8-bit drums for breakbeats |
+| HEXAGON | Electronic drum pads with big sweeping toms |
+| STUDIO | Clean acoustic kit |
+| BRUSHES | Jazz brushes |
+| TAPE LOFI | Acoustic kit through saturated tape |
+| VINYL | Dusty sample from a record: crackle and hiss |
+| 8-BIT | Game console chip sounds |
+| FELT | Soft, ambient mallets |
+
+- **How they're made:** all kits are synthesized, not stored as recordings, using the techniques classic machines relied on. Examples:
+  - pitch-swept sine kicks;
+  - two-tone snares;
+  - hats and cymbals from six detuned square oscillators;
+  - 6-bit and companded 8-bit sample character;
+  - sweeping electronic toms;
   - real cymbals as many inharmonic partials.
-- **Character:** each kit is then given the colour of its machine: sample rate, bit depth, saturation, tape roll-off, or vinyl crackle and hiss.
+- **Character:** each kit then gets its own colour: sample rate, bit depth, saturation, tape roll-off, or vinyl crackle and hiss.
 - **Rendering:** a kit is rendered when first used and pre-renders in the background, so switching never interrupts the audio.
-- **Checked against references:** measured against documented behaviour, for example the 808 kick settling at 49 Hz, its cowbell at 540 and 800 Hz, and the 909 kick sweeping from about 250 Hz.
+- **Checked against references:** measured against published descriptions of classic analog circuits, for example BOOMER's kick settling at 49 Hz, its cowbell at 540 and 800 Hz, and PUNCHY's kick sweeping down from about 250 Hz.
 - **Knobs:** **KIT**, **TUNE** (±12 semitones), **DECAY** (shortens every sound), **TONE** (darker ↔ thinner), **DRIVE** and **LEVEL**.
 
-The factory presets *808 groove* and *dusty vinyl beat* drive DRUMS from three sequencers. To get every sound as a WAV file, run `make drum-samples`. It writes `drum-samples/<kit>/01-kick-1.wav` … `16-….wav` (48 kHz, 16-bit, mono).
+The factory presets *boomer groove* and *dusty vinyl beat* drive DRUMS from three sequencers. To get every sound as a WAV file, run `make drum-samples`. It writes `drum-samples/<kit>/01-kick-1.wav` … `16-….wav` (48 kHz, 16-bit, mono).
 
 **About these sounds:**
 - **Who made them:** the drum sounds were created by Claude Opus 5.5, an AI model by Anthropic. It worked from rough, general descriptions of each machine's hardware characteristics: how its circuits or sample chips shape a kick, a snare, a hi-hat, and so on.
 - **Clean-room reimplementations:** nothing was sampled from real hardware, and no recordings or samples from anywhere else were used. Every sound is synthesized by the code in `raya.c`.
 - **Approximations:** they are rough implementations of how these drum kits approximately sound, not copies of the originals.
-- **Names:** names such as 808, 909 or LM DRUM only describe the style being approximated.
+- **Names:** the kit names are raya's own. raya is not affiliated with or endorsed by any drum machine manufacturer, and all trademarks belong to their owners.
 
 ## Sampler
 
@@ -151,6 +171,10 @@ make serve  # build and serve at http://localhost:8080
 ```
 
 MP3 export uses [shine](https://github.com/toots/shine), a small fixed-point MP3 encoder licensed under the LGPL-2.0. Decoding (WAV, MP3, OGG, FLAC, QOA) comes with raylib.
+
+## License
+
+raya is free software under the **GNU Lesser General Public License, version 2.1 or later** (see [LICENSE](LICENSE)). It uses raylib, the bundled single-header libraries, Emscripten and the shine MP3 encoder under their own licenses; see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ## Style
 

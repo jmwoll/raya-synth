@@ -1,4 +1,5 @@
 # raya — build raya.c to WebAssembly with raylib + Emscripten.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #   make deps    fetch emsdk, raylib and shine (MP3 encoder) into deps/ and
 #                build them for the web

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
 // Render every DRUMS kit of raya.c to WAV files: <out>/<kit>/<nn>-<pad>.wav
 // (48 kHz, 16-bit, mono). Used by `make drum-samples`.
 //
