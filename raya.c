@@ -18,6 +18,8 @@
 #include <ctype.h>
 #include <time.h>
 #include <stdint.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include "layer3.h"   // shine MP3 encoder
 
 #if defined(PLATFORM_WEB)
@@ -799,7 +801,16 @@ typedef struct {
     float  wph, fph, pplay;
     bool   rec, play, recNow, scrub;
     char   name[48];
+    unsigned id;           // names this tape's audio file inside a project
+    volatile bool dirty;   // audio changed since it was last stored
+    double savedT;
 } TapeSt;
+
+static unsigned new_id(void)
+{
+    static unsigned n;
+    return (unsigned)time(NULL) * 2654435761u + ++n * 40503u;
+}
 
 static const char *TAPE_BTN[TAPE_BTN_N] = { "REC", "PLAY", "LOAD", "WAV", "MP3", "CLEAR" };
 
@@ -810,6 +821,7 @@ static void tape_init(Module *m)
     s->buf = calloc((size_t)s->cap * 2, sizeof(short));
     s->rec = s->play = true;   // armed: patch something in and it echoes
     strcpy(s->name, "EMPTY TAPE");
+    s->id = new_id();
     m->st = s;
 }
 
@@ -863,6 +875,7 @@ static void tape_process(Module *m)
 
     if (s->recNow) {   // tape saturation keeps endless overdubs bounded
         int w = (int)s->h;
+        if (fabsf(inL) + fabsf(inR) > 1e-4f) s->dirty = true;
         float fb = m->p[2];
         s->buf[2 * w]     = (short)(tanhf(inL + fb * s->buf[2 * w]     / 32768.0f) * 32767.0f);
         s->buf[2 * w + 1] = (short)(tanhf(inR + fb * s->buf[2 * w + 1] / 32768.0f) * 32767.0f);
@@ -885,11 +898,12 @@ static bool tape_handover(TapeSt *s, short *buf, int cap, bool keepHead)
     return true;
 }
 
-static bool tape_load(Module *m, const char *path)
+// Put an audio file on the tape; returns its length in frames (0 on failure).
+static int tape_read_audio(Module *m, const char *path)
 {
     TapeSt *s = m->st;
     Wave w = LoadWave(path);
-    if (!w.data || !w.frameCount) { toast(TextFormat("CANNOT READ %s", GetFileName(path))); return false; }
+    if (!w.data || !w.frameCount) return 0;
     WaveFormat(&w, (int)SR, 16, 2);
     int n = (int)w.frameCount;
     if (n > TAPE_MAX_SEC * (int)SR) n = TAPE_MAX_SEC * (int)SR;
@@ -897,9 +911,16 @@ static bool tape_load(Module *m, const char *path)
     short *b = calloc((size_t)cap * 2, sizeof(short));
     memcpy(b, w.data, (size_t)n * 2 * sizeof(short));
     UnloadWave(w);
-    if (!tape_handover(s, b, cap, false)) return false;
+    return tape_handover(s, b, cap, false) ? n : 0;
+}
+
+static bool tape_load(Module *m, const char *path)
+{
+    TapeSt *s = m->st;
+    int n = tape_read_audio(m, path);
+    if (!n) { toast(TextFormat("CANNOT READ %s", GetFileName(path))); return false; }
     m->p[0] = clampf(n / SR, DEFS[m->type].knobs[0].min, DEFS[m->type].knobs[0].max);
-    s->rec = false; s->play = true;
+    s->rec = false; s->play = true; s->dirty = true;
     snprintf(s->name, sizeof s->name, "%s", GetFileName(path));
     toast(TextFormat("LOADED %s (%.1f S)", GetFileName(path), n / SR));
     return true;
@@ -940,26 +961,32 @@ static bool write_mp3(const char *path, const short *pcm, int frames)
 #define EXPORT_DIR "raya-data/recordings"
 #endif
 
-static void tape_export(Module *m, bool mp3)
+static bool write_wav(const char *path, const short *pcm, int frames)
 {
-    TapeSt *s = m->st;
-    int L = tape_len(m);
+    Wave w = { .frameCount = (unsigned int)frames, .sampleRate = (unsigned int)SR, .sampleSize = 16, .channels = 2, .data = (void *)pcm };
+    return ExportWave(w, path);
+}
+
+// Write 48 kHz stereo audio as raya-<what>-<time>.wav/.mp3 and hand it to the
+// user (a download in the browser, raya-data/recordings natively).
+static void export_audio(const short *pcm, int frames, bool mp3, const char *what)
+{
     char stamp[32], path[256];
     time_t now = time(NULL);
     strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", localtime(&now));
     MakeDirectory(EXPORT_DIR);
-    snprintf(path, sizeof path, "%s/raya-tape-%s.%s", EXPORT_DIR, stamp, mp3 ? "mp3" : "wav");
-    bool ok;
-    if (mp3) ok = write_mp3(path, s->buf, L);
-    else {
-        Wave w = { .frameCount = (unsigned int)L, .sampleRate = (unsigned int)SR, .sampleSize = 16, .channels = 2, .data = s->buf };
-        ok = ExportWave(w, path);
-    }
-    if (!ok) { toast("COULD NOT WRITE THE AUDIO FILE"); return; }
+    snprintf(path, sizeof path, "%s/raya-%s-%s.%s", EXPORT_DIR, what, stamp, mp3 ? "mp3" : "wav");
+    if (!(mp3 ? write_mp3(path, pcm, frames) : write_wav(path, pcm, frames))) { toast("COULD NOT WRITE THE AUDIO FILE"); return; }
 #if defined(PLATFORM_WEB)
     emscripten_run_script(TextFormat("rayaDownload('%s')", path));
 #endif
-    toast(TextFormat("SAVED %s (%.1f S)", GetFileName(path), L / SR));
+    toast(TextFormat("SAVED %s (%.1f S)", GetFileName(path), frames / SR));
+}
+
+static void tape_export(Module *m, bool mp3)
+{
+    TapeSt *s = m->st;
+    export_audio(s->buf, tape_len(m), mp3, "tape");
 }
 
 static Rectangle tape_wave_rect(Rectangle a) { return (Rectangle){ a.x, a.y, a.width, a.height - 28 }; }
@@ -1043,6 +1070,7 @@ static bool tape_press(Module *m, Vector2 mp, Rectangle a)
         case 5:
             if (s->buf) memset(s->buf, 0, (size_t)s->cap * 2 * sizeof(short));
             strcpy(s->name, "EMPTY TAPE");
+            s->dirty = true;
             break;
         }
         return true;
@@ -1063,17 +1091,24 @@ static void tape_drag(Module *m, Vector2 mp, Rectangle a)
     if (s->scrub) s->h = clampf((mp.x - wr.x - 2) / (wr.width - 4), 0, 0.999f) * tape_len(m);
 }
 
+// data line: rec play id name
 static void tape_save(const Module *m, char *out, int cap)
 {
     const TapeSt *s = m->st;
-    snprintf(out, cap, "%d %d", s->rec, s->play);
+    snprintf(out, cap, "%d %d %u %s", s->rec, s->play, s->id, s->name);
 }
 
 static void tape_load_data(Module *m, const char *str)
 {
     TapeSt *s = m->st;
-    int rec, play;
-    if (sscanf(str, "%d %d", &rec, &play) == 2) { s->rec = rec != 0; s->play = play != 0; }
+    int rec, play, used = 0;
+    unsigned id;
+    int n = sscanf(str, "%d %d %u %n", &rec, &play, &id, &used);
+    if (n >= 2) { s->rec = rec != 0; s->play = play != 0; }
+    if (n == 3) {
+        s->id = id;
+        if (used && str[used]) snprintf(s->name, sizeof s->name, "%s", str + used);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1587,9 +1622,34 @@ static const char *MOD_ID[M_COUNT] = {
 // Audio
 // ---------------------------------------------------------------------------
 
+// Transport and master recording. In the browser the audio callback runs on
+// the main thread; natively it would need a lock-free hand-over instead of
+// growing the recording buffer in place.
+#define REC_MAX_SEC (20 * 60)
+
+static volatile bool g_running = true;
+static volatile bool g_recording;
+static short *g_rec;
+static int    g_recLen, g_recCap;
+
+static void rec_append(const float *o, unsigned int frames)
+{
+    if (g_recLen + (int)frames > g_recCap) {
+        int cap = g_recCap ? g_recCap * 2 : 60 * (int)SR;
+        if (cap > REC_MAX_SEC * (int)SR) cap = REC_MAX_SEC * (int)SR;
+        if (cap < g_recLen + (int)frames) { g_recording = false; return; }   // full
+        short *b = realloc(g_rec, (size_t)cap * 2 * sizeof(short));
+        if (!b) { g_recording = false; return; }
+        g_rec = b; g_recCap = cap;
+    }
+    for (unsigned int i = 0; i < frames * 2; i++) g_rec[2 * (size_t)g_recLen + i] = (short)(o[i] * 32767.0f);
+    g_recLen += (int)frames;
+}
+
 static void audio_callback(void *buffer, unsigned int frames)
 {
     float *o = buffer;
+    if (!g_running) { memset(o, 0, frames * 2 * sizeof(float)); return; }
     g_cur = g_route;
     for (unsigned int f = 0; f < frames; f++) {
         for (int i = 0; i < MAX_MODULES; i++)
@@ -1605,6 +1665,7 @@ static void audio_callback(void *buffer, unsigned int frames)
         o[2 * f]     = clampf(L, -1, 1);
         o[2 * f + 1] = clampf(R, -1, 1);
     }
+    if (g_recording) rec_append(o, frames);
 }
 
 // ---------------------------------------------------------------------------
@@ -1903,21 +1964,22 @@ static int selection_count(void)
 
 static void select_none(void) { memset(sel, 0, sizeof sel); }
 
-// Serialize the selected modules (positions relative to their top-left corner)
-// and the cables running between them. Caller frees.
-static char *preset_serialize(const char *name)
+// Serialize modules and the cables running between them. A preset holds the
+// selection with positions relative to its top-left corner; a project holds
+// every module at its absolute position plus the view. Caller frees.
+static char *patch_serialize(const char *name, bool project)
 {
     Buf b = { malloc(1024), 0, 1024 };
     int map[MAX_MODULES], n = 0;
-    float x0 = 1e9f, y0 = 1e9f;
+    float x0 = project ? 0 : 1e9f, y0 = project ? 0 : 1e9f;
     for (int i = 0; i < MAX_MODULES; i++) {
         map[i] = -1;
-        if (!mods[i].alive || !sel[i]) continue;
+        if (!mods[i].alive || !(sel[i] || project)) continue;
         map[i] = n++;
-        x0 = fminf(x0, mods[i].pos.x);
-        y0 = fminf(y0, mods[i].pos.y);
+        if (!project) { x0 = fminf(x0, mods[i].pos.x); y0 = fminf(y0, mods[i].pos.y); }
     }
-    bput(&b, "raya-preset 1\nname %s\n", name);
+    if (project) bput(&b, "raya-project 1\nname %s\npan %.0f %.0f\n", name, pan.x, pan.y);
+    else         bput(&b, "raya-preset 1\nname %s\n", name);
     for (int i = 0; i < MAX_MODULES; i++) {
         if (map[i] < 0) continue;
         const Module *m = &mods[i];
@@ -1942,6 +2004,8 @@ static char *preset_serialize(const char *name)
     return b.s;
 }
 
+static char *preset_serialize(const char *name) { return patch_serialize(name, false); }
+
 // Iterate over the lines of a preset text.
 static const char *next_line(const char *p, char *line, int cap)
 {
@@ -1956,7 +2020,9 @@ static const char *next_line(const char *p, char *line, int cap)
 
 // Add the preset's modules with their top-left corner at world position `at`.
 // The new modules become the selection. Returns how many modules were added.
-static int preset_instantiate(const char *text, Vector2 at)
+// A preset's tapes get fresh ids so their audio never collides with another
+// tape's; a project keeps its ids to find its stored tape audio.
+static int preset_instantiate(const char *text, Vector2 at, bool keepIds)
 {
     int map[MAX_MODULES], n = 0, added = 0;
     Module *cur = NULL;
@@ -1993,6 +2059,9 @@ static int preset_instantiate(const char *text, Vector2 at)
                 add_cable(map[a], o, map[b], i, abs(c) % N_CABLE_COLORS);
         }
     }
+    if (!keepIds)
+        for (int i = 0; i < MAX_MODULES; i++)
+            if (sel[i] && mods[i].type == M_TAPE) ((TapeSt *)mods[i].st)->id = new_id();
     rebuild_routing();
     return added;
 }
@@ -2298,6 +2367,272 @@ static bool preset_matches(int slot, const char *query)
 }
 
 // ---------------------------------------------------------------------------
+// Projects — the whole patch (modules, knobs, steps, cables, view) plus the
+// audio on its tapes. The current project autosaves every couple of seconds,
+// so a reload picks up exactly where it was. Layout on disk (IndexedDB in the
+// browser, raya-data natively):
+//   <root>/projects/<slug>/project.raya     the patch as text
+//   <root>/projects/<slug>/tape-<id>.wav    audio of each tape
+//   <root>/current                          slug of the open project
+// ---------------------------------------------------------------------------
+
+#define PROJECT_DIR   PRESET_ROOT "/projects"
+#define PROJECT_MAX   256
+#define AUTOSAVE_SEC  2.0
+
+typedef struct { char slug[PRESET_NAME_MAX + 1], name[PRESET_NAME_MAX + 1]; time_t mtime; } ProjectInfo;
+
+static char   proj_slug[PRESET_NAME_MAX + 1], proj_name[PRESET_NAME_MAX + 1];
+static bool   proj_ready;
+static char  *proj_last;      // text as last written, to skip unchanged saves
+static double proj_saveT;
+static ProjectInfo proj_list[PROJECT_MAX];
+static int    proj_count;
+
+static void proj_file(char *out, int cap, const char *slug, const char *file)
+{
+    snprintf(out, cap, "%s/%s/%s", PROJECT_DIR, slug, file);
+}
+
+static bool proj_exists(const char *slug)
+{
+    char path[256];
+    proj_file(path, sizeof path, slug, "project.raya");
+    return FileExists(path);
+}
+
+// A slug for `name` that no other project uses yet.
+static void proj_unique_slug(const char *name, char *out)
+{
+    char base[PRESET_NAME_MAX + 1];
+    make_slug(name, base);
+    snprintf(out, PRESET_NAME_MAX + 1, "%s", base);
+    for (int i = 2; proj_exists(out); i++) snprintf(out, PRESET_NAME_MAX + 1, "%.*s-%d", PRESET_NAME_MAX - 5, base, i);
+}
+
+static void proj_set_current(void)
+{
+    write_file(PRESET_ROOT "/current", proj_slug);
+}
+
+// Store tape audio that changed. Big tapes are written less often while they
+// keep recording; `force` writes every changed tape now.
+static bool proj_save_tapes(bool force)
+{
+    bool wrote = false;
+    double now = GetTime();
+    for (int i = 0; i < MAX_MODULES; i++) {
+        Module *m = &mods[i];
+        if (!m->alive || m->type != M_TAPE) continue;
+        TapeSt *s = m->st;
+        int L = tape_len(m);
+        if (!s->dirty || !s->buf || (!force && now - s->savedT < 20 + L / SR * 0.5)) continue;
+        char path[256];
+        proj_file(path, sizeof path, proj_slug, TextFormat("tape-%u.wav", s->id));
+        s->dirty = false;
+        s->savedT = now;
+        if (write_wav(path, s->buf, L)) wrote = true;
+    }
+    return wrote;
+}
+
+// Remove stored tape audio that no tape in the patch refers to any more.
+static void proj_prune_tapes(void)
+{
+    char dir[256];
+    snprintf(dir, sizeof dir, "%s/%s", PROJECT_DIR, proj_slug);
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        unsigned id;
+        if (sscanf(e->d_name, "tape-%u.wav", &id) != 1) continue;
+        bool used = false;
+        for (int i = 0; i < MAX_MODULES && !used; i++)
+            used = mods[i].alive && mods[i].type == M_TAPE && ((TapeSt *)mods[i].st)->id == id;
+        if (!used) remove(TextFormat("%s/%s", dir, e->d_name));
+    }
+    closedir(d);
+}
+
+static void project_save(bool force)
+{
+    if (!proj_slug[0]) return;
+    char *text = patch_serialize(proj_name, true);
+    bool changed = !proj_last || strcmp(text, proj_last);
+    bool wrote = false;
+    if (changed || force) {
+        char path[256];
+        MakeDirectory(TextFormat("%s/%s", PROJECT_DIR, proj_slug));
+        proj_file(path, sizeof path, proj_slug, "project.raya");
+        if (write_file(path, text)) wrote = true;
+        free(proj_last);
+        proj_last = text;
+        text = NULL;
+    }
+    free(text);
+    if (proj_save_tapes(force)) wrote = true;
+    if (changed) proj_prune_tapes();
+    if (wrote) fs_sync();
+}
+
+static void project_tick(void)
+{
+    if (!proj_ready || GetTime() - proj_saveT < AUTOSAVE_SEC) return;
+    proj_saveT = GetTime();
+    project_save(false);
+}
+
+static void patch_clear(void)
+{
+    for (int i = 0; i < MAX_MODULES; i++) if (mods[i].alive) remove_module(i);
+    ncables = 0;
+    rebuild_routing();
+    select_none();
+}
+
+static bool project_open(const char *slug)
+{
+    char path[256];
+    proj_file(path, sizeof path, slug, "project.raya");
+    char *text = read_file(path);
+    if (!text || strncmp(text, "raya-project", 12)) { free(text); return false; }
+    patch_clear();
+    preset_instantiate(text, (Vector2){ 0, 0 }, true);
+    select_none();
+    snprintf(proj_slug, sizeof proj_slug, "%s", slug);
+    snprintf(proj_name, sizeof proj_name, "%s", slug);
+    char line[256];
+    for (const char *p = text; *p; ) {
+        p = next_line(p, line, sizeof line);
+        if (!strncmp(line, "name ", 5)) snprintf(proj_name, sizeof proj_name, "%s", line + 5);
+        else sscanf(line, "pan %f %f", &pan.x, &pan.y);
+    }
+    for (int i = 0; i < MAX_MODULES; i++) {   // tapes get their audio back
+        Module *m = &mods[i];
+        if (!m->alive || m->type != M_TAPE) continue;
+        TapeSt *s = m->st;
+        proj_file(path, sizeof path, slug, TextFormat("tape-%u.wav", s->id));
+        if (FileExists(path)) tape_read_audio(m, path);
+        s->dirty = false;
+        s->savedT = GetTime();
+    }
+    free(proj_last);
+    proj_last = text;
+    proj_set_current();
+    fs_sync();
+    return true;
+}
+
+static void project_new(const char *name)
+{
+    project_save(true);
+    patch_clear();
+    pan = (Vector2){ 0, 0 };
+    snprintf(proj_name, sizeof proj_name, "%s", name);
+    proj_unique_slug(name, proj_slug);
+    free(proj_last); proj_last = NULL;
+    proj_set_current();
+    project_save(true);
+}
+
+// Continue under a new name, keeping the original as it was.
+static void project_duplicate(const char *name)
+{
+    project_save(true);
+    snprintf(proj_name, sizeof proj_name, "%s", name);
+    proj_unique_slug(name, proj_slug);
+    free(proj_last); proj_last = NULL;
+    for (int i = 0; i < MAX_MODULES; i++)   // write every tape into the copy
+        if (mods[i].alive && mods[i].type == M_TAPE) ((TapeSt *)mods[i].st)->dirty = true;
+    proj_set_current();
+    project_save(true);
+}
+
+static void project_rename(const char *name)
+{
+    char slug[PRESET_NAME_MAX + 1];
+    make_slug(name, slug);
+    if (strcmp(slug, proj_slug)) {
+        proj_unique_slug(name, slug);
+        rename(TextFormat("%s/%s", PROJECT_DIR, proj_slug), TextFormat("%s/%s", PROJECT_DIR, slug));
+        snprintf(proj_slug, sizeof proj_slug, "%s", slug);
+    }
+    snprintf(proj_name, sizeof proj_name, "%s", name);
+    free(proj_last); proj_last = NULL;
+    proj_set_current();
+    project_save(true);
+}
+
+static void project_delete(const char *slug)
+{
+    char dir[256];
+    snprintf(dir, sizeof dir, "%s/%s", PROJECT_DIR, slug);
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)))
+            if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) remove(TextFormat("%s/%s", dir, e->d_name));
+        closedir(d);
+    }
+    remove(dir);
+    fs_sync();
+}
+
+static int proj_cmp(const void *a, const void *b)
+{
+    time_t x = ((const ProjectInfo *)a)->mtime, y = ((const ProjectInfo *)b)->mtime;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+// All projects, most recently changed first.
+static void project_scan(void)
+{
+    proj_count = 0;
+    DIR *d = opendir(PROJECT_DIR);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) && proj_count < PROJECT_MAX) {
+        if (e->d_name[0] == '.') continue;
+        char path[256];
+        struct stat st;
+        proj_file(path, sizeof path, e->d_name, "project.raya");
+        if (stat(path, &st) != 0) continue;
+        ProjectInfo *pi = &proj_list[proj_count++];
+        snprintf(pi->slug, sizeof pi->slug, "%s", e->d_name);
+        snprintf(pi->name, sizeof pi->name, "%s", e->d_name);
+        pi->mtime = st.st_mtime;
+        char *text = read_file(path), line[256];
+        for (const char *p = text ? text : ""; *p; ) {
+            p = next_line(p, line, sizeof line);
+            if (!strncmp(line, "name ", 5)) { snprintf(pi->name, sizeof pi->name, "%s", line + 5); break; }
+        }
+        free(text);
+    }
+    closedir(d);
+    qsort(proj_list, proj_count, sizeof proj_list[0], proj_cmp);
+}
+
+// First start: open the last project, or begin one with the starter patch.
+static void default_layout(void);
+static void project_boot(void)
+{
+    MakeDirectory(PROJECT_DIR);
+    char *cur = read_file(PRESET_ROOT "/current");
+    bool ok = cur && cur[0] && project_open(cur);
+    free(cur);
+    if (!ok) {
+        default_layout();
+        snprintf(proj_name, sizeof proj_name, "untitled");
+        proj_unique_slug(proj_name, proj_slug);
+        proj_set_current();
+        project_save(true);
+    }
+    proj_saveT = GetTime();
+    proj_ready = true;
+}
+
+// ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------
 
@@ -2433,7 +2768,8 @@ static void draw_cable(Vector2 a, Vector2 b, Color c, float alpha)
 // ---------------------------------------------------------------------------
 
 enum { D_NONE, D_MODULE, D_KNOB, D_CABLE, D_PAN, D_CUSTOM, D_BOX, D_MAP };
-enum { MODAL_NONE, MODAL_RACK, MODAL_SAVE };
+enum { MODAL_NONE, MODAL_RACK, MODAL_SAVE, MODAL_PROJECTS, MODAL_NAME, MODAL_REC };
+enum { NAME_NEW, NAME_RENAME, NAME_DUPLICATE };
 
 static struct {
     int     mode;
@@ -2454,6 +2790,10 @@ static struct {
     Vector2 placePos;
     char    toast[96];
     double  toastT;
+    // projects, transport, recording
+    int     nameAction;
+    bool    recOn, video;
+    double  videoT;
 } ui = { .lastKnobMod = -1, .toastT = -10 };
 
 static const int MENU_ORDER[M_COUNT] = { M_CLOCK, M_LFO, M_SEQ, M_CHORD, M_ARP, M_PERF, M_OSC3, M_TAPE, M_REVERB, M_OUT };
@@ -2472,7 +2812,11 @@ static void toast(const char *s) { snprintf(ui.toast, sizeof ui.toast, "%s", s);
 // --- top bar buttons --------------------------------------------------------
 
 static Rectangle btn_rack(void) { return (Rectangle){ GetScreenWidth() - 18 - 150.0f, 14, 150, 26 }; }
-static Rectangle btn_save(void) { Rectangle r = btn_rack(); return (Rectangle){ r.x - 10 - 190, r.y, 190, 26 }; }
+static Rectangle btn_save(void) { Rectangle r = btn_rack(); return (Rectangle){ r.x + r.width - 190, r.y + 30, 190, 26 }; }
+static Rectangle btn_project(void) { return (Rectangle){ 150, 14, 200, 26 }; }
+static Rectangle btn_run(void)     { return (Rectangle){ 360, 14, 64, 26 }; }
+static Rectangle btn_rec(void)     { return (Rectangle){ 430, 14, 110, 26 }; }
+static Rectangle btn_video(void)   { return (Rectangle){ 546, 14, 116, 26 }; }
 
 // --- patch overview (minimap) ---------------------------------------------
 
@@ -2483,7 +2827,7 @@ typedef struct { bool show; Rectangle box; float s; Vector2 o; } Minimap;  // ma
 
 static Minimap minimap(void)
 {
-    Minimap m = { .box = { GetScreenWidth() - 18.0f - MAP_W, 52, MAP_W, MAP_H } };
+    Minimap m = { .box = { GetScreenWidth() - 18.0f - MAP_W, 78, MAP_W, MAP_H } };
     // fit the patch itself; the view frame is clipped to the box
     float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
     for (int i = 0; i < MAX_MODULES; i++) {
@@ -2627,7 +2971,7 @@ static void load_preset(int slot)
         }
         at = any ? (Vector2){ maxX + 40, minY } : (Vector2){ 24 - pan.x, 70 - pan.y };
     }
-    int n = preset_instantiate(rack[slot].text, at);
+    int n = preset_instantiate(rack[slot].text, at, false);
     if (!ui.placeAt && n) {   // bring the new modules into view
         float sx = at.x + pan.x, sy = at.y + pan.y;
         if (sx < 0 || sx > GetScreenWidth() - 240 || sy < 0 || sy > GetScreenHeight() - 120) {
@@ -2655,8 +2999,145 @@ static void text_input(void)
     if ((IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) && len) ui.text[--len] = 0;
 }
 
+// --- projects, transport and recording ----------------------------------------
+
+static const char *clock_text(double sec) { int t = (int)sec; return TextFormat("%02d:%02d", t / 60, t % 60); }
+
+static void open_projects(void)
+{
+    project_save(true);
+    project_scan();
+    ui.modal = MODAL_PROJECTS;
+    ui.hl = ui.scroll = ui.confirmDel = 0;
+    ui.menu = false;
+    drain_chars();
+}
+
+static void open_name(int action)
+{
+    ui.modal = MODAL_NAME;
+    ui.nameAction = action;
+    if (action == NAME_RENAME) snprintf(ui.text, sizeof ui.text, "%s", proj_name);
+    else if (action == NAME_DUPLICATE) snprintf(ui.text, sizeof ui.text, "%.*s copy", PRESET_NAME_MAX - 5, proj_name);
+    else ui.text[0] = 0;
+    drain_chars();
+}
+
+static void toggle_run(void) { g_running = !g_running; toast(g_running ? "RUNNING" : "STOPPED"); }
+
+static void toggle_rec(void)
+{
+    if (g_recording) { g_recording = false; return; }   // frame() then offers to save it
+    if (ui.modal == MODAL_REC) return;
+    g_recLen = 0;
+    g_running = true;
+    g_recording = true;
+    ui.recOn = true;
+    toast("RECORDING THE OUTPUT");
+}
+
+static void toggle_video(void)
+{
+#if defined(PLATFORM_WEB)
+    if (!ui.video) {
+        if (emscripten_run_script_int("rayaVideoStart()")) { ui.video = true; ui.videoT = GetTime(); g_running = true; toast("RECORDING VIDEO"); }
+        else toast("THIS BROWSER CANNOT RECORD VIDEO");
+    } else {
+        emscripten_run_script("rayaVideoStop()");
+        ui.video = false;
+        toast(TextFormat("SAVED A %s VIDEO", clock_text(GetTime() - ui.videoT)));
+    }
+#else
+    toast("VIDEO RECORDING WORKS IN THE BROWSER");
+#endif
+}
+
+static Rectangle proj_btn(int i)   // NEW / DUPLICATE / RENAME above the list
+{
+    Rectangle r = rack_search();
+    float w = (r.width - 16) / 3;
+    return (Rectangle){ r.x + i * (w + 8), r.y, w, r.height };
+}
+
+static void projects_input(Vector2 mp)
+{
+    bool click = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+    int vis = rack_visible();
+    float wheel = GetMouseWheelMove();
+    if (wheel != 0) ui.scroll = clampi(ui.scroll - (wheel > 0 ? 2 : -2), 0, proj_count > vis ? proj_count - vis : 0);
+    if (IsKeyPressed(KEY_ESCAPE)) { ui.modal = MODAL_NONE; return; }
+    if (!click) return;
+    if (!CheckCollisionPointRec(mp, rack_box())) { ui.modal = MODAL_NONE; return; }
+    for (int i = 0; i < 3; i++)
+        if (CheckCollisionPointRec(mp, proj_btn(i))) { open_name(i == 0 ? NAME_NEW : i == 1 ? NAME_DUPLICATE : NAME_RENAME); return; }
+    for (int v = 0; v < vis && ui.scroll + v < proj_count; v++) {
+        Rectangle row = rack_row(v);
+        if (!CheckCollisionPointRec(mp, row)) continue;
+        int i = ui.scroll + v;
+        bool current = !strcmp(proj_list[i].slug, proj_slug);
+        if (!current && CheckCollisionPointRec(mp, rack_del(row))) {
+            if (ui.confirmDel == i + 1) {
+                toast(TextFormat("DELETED %s", proj_list[i].name));
+                project_delete(proj_list[i].slug);
+                project_scan();
+                ui.confirmDel = 0;
+            } else ui.confirmDel = i + 1;
+            return;
+        }
+        if (!current) {
+            project_save(true);
+            char slug[PRESET_NAME_MAX + 1];
+            snprintf(slug, sizeof slug, "%s", proj_list[i].slug);
+            toast(project_open(slug) ? TextFormat("OPENED %s", proj_name) : "COULD NOT OPEN THE PROJECT");
+        }
+        ui.modal = MODAL_NONE;
+        return;
+    }
+    ui.confirmDel = 0;
+}
+
+static void name_input(Vector2 mp)
+{
+    bool click = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+    text_input();
+    if ((IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || (click && CheckCollisionPointRec(mp, save_ok()))) && ui.text[0]) {
+        if (ui.nameAction == NAME_NEW) project_new(ui.text);
+        else if (ui.nameAction == NAME_RENAME) project_rename(ui.text);
+        else project_duplicate(ui.text);
+        toast(TextFormat("PROJECT %s", proj_name));
+        ui.modal = MODAL_NONE;
+    } else if (IsKeyPressed(KEY_ESCAPE) || (click && (CheckCollisionPointRec(mp, save_cancel()) || !CheckCollisionPointRec(mp, save_box()))))
+        open_projects();
+}
+
+static Rectangle rec_btn(int i)    // SAVE WAV / SAVE MP3 / DISCARD
+{
+    Rectangle b = save_box();
+    float w = (b.width - 32 - 16) / 3;
+    return (Rectangle){ b.x + 16 + i * (w + 8), b.y + b.height - 44, w, 28 };
+}
+
+static void rec_close(void)
+{
+    free(g_rec);
+    g_rec = NULL;
+    g_recLen = g_recCap = 0;
+    ui.modal = MODAL_NONE;
+}
+
+static void rec_input(Vector2 mp)
+{
+    bool click = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+    if (click && CheckCollisionPointRec(mp, rec_btn(0))) export_audio(g_rec, g_recLen, false, "patch");
+    else if (click && CheckCollisionPointRec(mp, rec_btn(1))) export_audio(g_rec, g_recLen, true, "patch");
+    else if (IsKeyPressed(KEY_ESCAPE) || (click && CheckCollisionPointRec(mp, rec_btn(2)))) rec_close();
+}
+
 static void modal_input(Vector2 mp)
 {
+    if (ui.modal == MODAL_PROJECTS) { projects_input(mp); return; }
+    if (ui.modal == MODAL_NAME)     { name_input(mp); return; }
+    if (ui.modal == MODAL_REC)      { rec_input(mp); return; }
     bool click = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
     if (ui.modal == MODAL_SAVE) {
         text_input();
@@ -2727,6 +3208,10 @@ static void handle_input(void)
     }
 
     // keyboard
+    if (IsKeyPressed(KEY_SPACE)) toggle_run();
+    if (IsKeyPressed(KEY_R) && !cmd) toggle_rec();
+    if (IsKeyPressed(KEY_V) && !cmd) toggle_video();
+    if (IsKeyPressed(KEY_O) && !cmd) { open_projects(); return; }
     if (IsKeyPressed(KEY_P) && !cmd) { open_rack(false, mp); return; }
     if (IsKeyPressed(KEY_S) && !cmd) { open_save(); return; }
     if (cmd && IsKeyPressed(KEY_A)) for (int i = 0; i < MAX_MODULES; i++) sel[i] = mods[i].alive;
@@ -2739,6 +3224,10 @@ static void handle_input(void)
         ui.press = mp;
         if (CheckCollisionPointRec(mp, btn_rack())) { open_rack(false, mp); return; }
         if (selection_count() && CheckCollisionPointRec(mp, btn_save())) { open_save(); return; }
+        if (CheckCollisionPointRec(mp, btn_project())) { open_projects(); return; }
+        if (CheckCollisionPointRec(mp, btn_run()))     { toggle_run(); return; }
+        if (CheckCollisionPointRec(mp, btn_rec()))     { toggle_rec(); return; }
+        if (CheckCollisionPointRec(mp, btn_video()))   { toggle_video(); return; }
         Minimap mm = minimap();
         if (mm.show && CheckCollisionPointRec(mp, mm.box)) { mapDrag = mm; map_center_view(&mm, mp); ui.mode = D_MAP; ui.last = mp; return; }
         if (find_port(mp, &pm, &pi, &po)) {
@@ -2952,6 +3441,85 @@ static void draw_save(Vector2 mp)
     draw_button(save_ok(), "SAVE", mp, ui.text[0] != 0);
 }
 
+static void draw_projects(Vector2 mp)
+{
+    Rectangle b = rack_box();
+    draw_dialog_frame(b, "PROJECTS");
+    const char *count = TextFormat("%d SAVED IN THIS BROWSER", proj_count);
+    txt(count, b.x + b.width - 16 - txt_w(count, 10), b.y + 10, 10, TEXT_DIM);
+    static const char *labels[3] = { "NEW PROJECT", "DUPLICATE", "RENAME" };
+    for (int i = 0; i < 3; i++) draw_button(proj_btn(i), labels[i], mp, false);
+    Rectangle l = rack_list();
+    DrawRectangleRec(l, INSET);
+    int vis = rack_visible();
+    for (int v = 0; v < vis && ui.scroll + v < proj_count; v++) {
+        int i = ui.scroll + v;
+        const ProjectInfo *pi = &proj_list[i];
+        Rectangle row = rack_row(v);
+        bool current = !strcmp(pi->slug, proj_slug), hover = CheckCollisionPointRec(mp, row);
+        if (current || hover) DrawRectangleRec(row, fade(ACCENT, current ? 0.12f : 0.06f));
+        if (current) DrawRectangle((int)row.x, (int)row.y, 2, (int)row.height, ACCENT);
+        txt(pi->name, row.x + 12, row.y + 9, 12, current ? ACCENT : TEXT);
+        Rectangle del = rack_del(row);
+        bool armed = ui.confirmDel == i + 1;
+        char when[40];
+        strftime(when, sizeof when, "%Y-%m-%d %H:%M", localtime(&pi->mtime));
+        const char *info = current ? "OPEN NOW" : armed ? "CLICK X AGAIN TO DELETE" : when;
+        txt(info, del.x - 12 - txt_w(info, 10), row.y + 10, 10, armed ? CABLE_COLORS[1] : TEXT_DIM);
+        if (!current && (hover || armed))
+            txt_c("x", del.x + del.width / 2, del.y + 3, 10, CheckCollisionPointRec(mp, del) || armed ? CABLE_COLORS[1] : TEXT_DIM);
+    }
+    txt("CLICK: OPEN    CHANGES SAVE THEMSELVES    ESC: CLOSE", b.x + 16, b.y + b.height - 24, 10, TEXT_DIM);
+}
+
+static void draw_name(Vector2 mp)
+{
+    static const char *titles[3] = { "NEW PROJECT", "RENAME PROJECT", "DUPLICATE PROJECT" };
+    Rectangle b = save_box();
+    draw_dialog_frame(b, titles[ui.nameAction]);
+    txt(ui.nameAction == NAME_NEW ? "STARTS WITH AN EMPTY PATCH; THE CURRENT ONE IS SAVED"
+        : ui.nameAction == NAME_DUPLICATE ? "CONTINUE IN A COPY; THE ORIGINAL STAYS AS IT IS" : "GIVE THIS PROJECT A NEW NAME",
+        b.x + 16, b.y + 40, 10, TEXT_DIM);
+    draw_field(save_field(), ui.text, "PROJECT NAME");
+    draw_button(save_cancel(), "CANCEL", mp, false);
+    draw_button(save_ok(), ui.nameAction == NAME_RENAME ? "RENAME" : "CREATE", mp, ui.text[0] != 0);
+}
+
+static void draw_rec(Vector2 mp)
+{
+    Rectangle b = save_box();
+    draw_dialog_frame(b, "RECORDING");
+    txt(clock_text(g_recLen / SR), b.x + 16, b.y + 46, 20, ACCENT);
+    txt("48 KHZ STEREO, FROM THE OUTPUT MODULES", b.x + 16, b.y + 78, 10, TEXT_DIM);
+    txt("SAVE IT IN ONE OR BOTH FORMATS; CLOSING DISCARDS IT", b.x + 16, b.y + 100, 10, TEXT_DIM);
+    draw_button(rec_btn(0), "SAVE WAV", mp, true);
+    draw_button(rec_btn(1), "SAVE MP3", mp, true);
+    draw_button(rec_btn(2), "CLOSE", mp, false);
+}
+
+// Project and transport buttons beside the brand.
+static void draw_topbar(Vector2 mp)
+{
+    draw_button(btn_project(), TextFormat("PROJECT  %s", proj_name[0] ? proj_name : "..."), mp, false);
+    bool running = g_running;
+    draw_button(btn_run(), running ? "STOP" : "RUN", mp, !running);
+    bool blink = fmodf((float)GetTime(), 1.0f) < 0.6f;
+    Rectangle r = btn_rec();
+    if (g_recording) {
+        DrawRectangleRec(r, fade(CABLE_COLORS[1], 0.18f));
+        DrawRectangleLinesEx(r, 1, CABLE_COLORS[1]);
+        if (blink) DrawCircleV((Vector2){ r.x + 12, r.y + r.height / 2 }, 3.5f, CABLE_COLORS[1]);
+        txt_c(TextFormat("REC %s", clock_text(g_recLen / SR)), r.x + r.width / 2 + 6, r.y + 8, 10, CABLE_COLORS[1]);
+    } else draw_button(r, "REC AUDIO", mp, false);
+    r = btn_video();
+    if (ui.video) {
+        DrawRectangleRec(r, fade(CABLE_COLORS[1], 0.18f));
+        DrawRectangleLinesEx(r, 1, CABLE_COLORS[1]);
+        if (blink) DrawCircleV((Vector2){ r.x + 12, r.y + r.height / 2 }, 3.5f, CABLE_COLORS[1]);
+        txt_c(TextFormat("VIDEO %s", clock_text(GetTime() - ui.videoT)), r.x + r.width / 2 + 6, r.y + 8, 10, CABLE_COLORS[1]);
+    } else draw_button(r, "REC VIDEO", mp, false);
+}
+
 // ---------------------------------------------------------------------------
 // Audio files arriving from the file picker or by drag and drop
 // ---------------------------------------------------------------------------
@@ -3000,9 +3568,15 @@ static void frame(void)
         SetWindowSize(syncW, syncH);
     }
 #endif
-    if (!rack_ready && fs_ready()) rack_load();
+    if (!rack_ready && fs_ready()) { rack_load(); project_boot(); }
+    project_tick();
     handle_audio_files(GetMousePosition());
     handle_input();
+    if (ui.recOn && !g_recording) {   // stopped by hand or full: offer to save it
+        ui.recOn = false;
+        ui.menu = false;
+        ui.modal = g_recLen > 0 ? MODAL_REC : MODAL_NONE;
+    }
     Vector2 mp = GetMousePosition();
     Minimap mm = minimap();
     bool overlay = ui.modal || ui.menu || ui.mode == D_MAP || (mm.show && CheckCollisionPointRec(mp, mm.box));
@@ -3043,10 +3617,17 @@ static void frame(void)
     txt("AMBIENT MODULAR", 18, 38, 10, TEXT_DIM);
     Vector2 bmp = overlay ? (Vector2){ -1, -1 } : mp;
     draw_button(btn_rack(), TextFormat("PRESET RACK  %d", rack_count), bmp, false);
+    draw_topbar(bmp);
+    bool empty = true;
+    for (int i = 0; i < MAX_MODULES && empty; i++) empty = !mods[i].alive;
+    if (empty && proj_ready) {
+        txt_c("AN EMPTY PATCH", GetScreenWidth() / 2.0f, GetScreenHeight() / 2.0f - 20, 20, fade(TEXT, 0.7f));
+        txt_c("RIGHT-CLICK TO ADD A MODULE, OR PRESS P TO LOAD A PRESET", GetScreenWidth() / 2.0f, GetScreenHeight() / 2.0f + 12, 10, TEXT_DIM);
+    }
     draw_minimap(ui.modal || ui.menu ? (Vector2){ -1, -1 } : mp);
     int ns = selection_count();
     if (ns) draw_button(btn_save(), TextFormat("SAVE %d MODULE%s AS PRESET", ns, ns == 1 ? "" : "S"), bmp, true);
-    txt("DRAG JACK TO JACK: PATCH   RIGHT-CLICK JACK: UNPLUG   RIGHT-CLICK SPACE: ADD   DRAG SPACE: PAN   SHIFT-DRAG SPACE: SELECT   DROP AUDIO FILE: TAPE   P: PRESETS   S: SAVE SELECTION   DOUBLE-CLICK KNOB: RESET",
+    txt("SPACE: RUN/STOP   R: REC AUDIO   V: REC VIDEO   O: PROJECTS   P: PRESETS   S: SAVE SELECTION   DRAG JACK TO JACK: PATCH   RIGHT-CLICK JACK: UNPLUG   RIGHT-CLICK SPACE: ADD   SHIFT-DRAG: SELECT   DROP AUDIO FILE: TAPE",
         18, GetScreenHeight() - 22, 10, fade(TEXT_DIM, 0.8f));
 
     if (ui.menu) {
@@ -3065,6 +3646,9 @@ static void frame(void)
     }
     if (ui.modal == MODAL_RACK) draw_rack(mp);
     if (ui.modal == MODAL_SAVE) draw_save(mp);
+    if (ui.modal == MODAL_PROJECTS) draw_projects(mp);
+    if (ui.modal == MODAL_NAME) draw_name(mp);
+    if (ui.modal == MODAL_REC) draw_rec(mp);
 
     float ta = 1.0f - (float)(GetTime() - ui.toastT - 2.0) / 0.6f;
     if (ta > 0) {
@@ -3080,7 +3664,7 @@ static void frame(void)
 static void default_layout(void)
 {
     char *text = factory_text(0);
-    preset_instantiate(text, (Vector2){ 24, 70 });
+    preset_instantiate(text, (Vector2){ 24, 70 }, false);
     free(text);
     select_none();
 }
@@ -3102,8 +3686,7 @@ int main(void)
         "catch (e) { console.error('raya: no preset storage', e); Module.rayaFsReady = 1; }");
 #endif
 
-    default_layout();
-    rebuild_routing();
+    rebuild_routing();   // the patch arrives with the project once storage is ready
 
     InitAudioDevice();
     SetAudioStreamBufferSizeDefault(2048);

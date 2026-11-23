@@ -37,6 +37,13 @@ Pitch cables carry octaves relative to C4; gates and modulation carry 0..1. Seve
 
 **Playing:** raya starts with a patch that already sounds: chords from CHORDS into 3X OSC, through REVERB to OUTPUT, with the LFO on the filter and the sequencer morphing the waveform. Click once to unlock audio in the browser. Drag from jack to jack to patch. Right-click a jack to unplug it. Right-click empty space to add a module. Drag empty space to pan; the overview in the top-right corner shows the whole patch, and clicking or dragging in it jumps there. Drag knobs vertically (Shift = fine), use the mouse wheel, double-click to reset.
 
+## Projects, running and recording
+
+- **Project:** everything you build is a project. That covers modules, knob settings, sequencer steps, cables, the view and the audio on every tape. It saves itself every couple of seconds, so closing or reloading the page picks up exactly where you were. Click the project name (or press **O**) to start a **new** empty project, **duplicate** or **rename** the current one, open another, or delete one (click its **x** twice). Projects live in the browser's IndexedDB rather than localStorage, because tapes hold far more audio than localStorage allows; natively they go in `raya-data/projects/`.
+- **Run:** **STOP/RUN** (or **Space**) pauses and resumes the whole patch.
+- **Record audio:** **REC AUDIO** (or **R**) records the output. Stop it the same way, then save the take as WAV and/or MP3 (48 kHz stereo). Up to 20 minutes per take.
+- **Record video:** **REC VIDEO** (or **V**) records the screen together with the sound, using the browser's own recorder. It saves an MP4 where the browser supports it (Chrome, Safari) and WebM otherwise.
+
 ## Performer
 
 PERFORMER plays solo lines the way a player would in blues, jazz, rock or pop, slowed down to sit inside an ambient piece. It has 192 phrases:
