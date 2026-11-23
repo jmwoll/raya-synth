@@ -16,6 +16,9 @@
 #include <stdbool.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <time.h>
+#include <stdint.h>
+#include "layer3.h"   // shine MP3 encoder
 
 #if defined(PLATFORM_WEB)
 #include <emscripten/emscripten.h>
@@ -123,6 +126,7 @@ typedef struct {
     // optional: extra state stored in presets (beyond knob values)
     void (*save)(const Module *, char *out, int cap);
     void (*load)(Module *, const char *data);
+    void (*fini)(Module *);   // optional: free what init allocated besides st
 } ModDef;
 
 struct Module {
@@ -147,7 +151,7 @@ static bool   sel[MAX_MODULES];   // selected in the UI
 static volatile int g_route;  // routing copy the audio thread should use
 static int    g_cur;          // routing copy used during the current audio block
 
-enum { M_CLOCK, M_SEQ, M_CHORD, M_OSC3, M_LFO, M_REVERB, M_OUT, M_COUNT };
+enum { M_CLOCK, M_SEQ, M_CHORD, M_OSC3, M_LFO, M_REVERB, M_OUT, M_TAPE, M_COUNT };
 static const ModDef DEFS[M_COUNT];
 
 static float IN(Module *m, int i)
@@ -773,6 +777,306 @@ static void out_draw(Module *m, Rectangle a)
 }
 
 // ---------------------------------------------------------------------------
+// TAPE — a tape loop that plays, records and overdubs. TIME is the loop
+// length and so also the echo time: playback reads one loop behind the
+// record head, recording writes input + FEEDBACK x old tape. Loads .wav,
+// .mp3, .ogg, .flac and .qoa; exports the loop as .wav or .mp3.
+// ---------------------------------------------------------------------------
+
+#define TAPE_INIT_SEC 16     // initial tape, grows with TIME
+#define TAPE_MAX_SEC  300    // longest tape; longer files are cut here
+#define TAPE_BTN_N    6
+
+static void toast(const char *s);
+static int  g_pickTarget = -1;   // tape module waiting for the file picker
+
+typedef struct {
+    short *buf; int cap;                     // stereo frames, int16
+    short *next; int nextCap; bool nextKeep; // replacement buffer from the UI...
+    volatile int swap;                       // ...swapped in by the audio thread
+    short *old;                              // retired buffer, freed by the UI
+    double h;                                // head position in frames
+    float  wph, fph, pplay;
+    bool   rec, play, recNow, scrub;
+    char   name[48];
+} TapeSt;
+
+static const char *TAPE_BTN[TAPE_BTN_N] = { "REC", "PLAY", "LOAD", "WAV", "MP3", "CLEAR" };
+
+static void tape_init(Module *m)
+{
+    TapeSt *s = calloc(1, sizeof(TapeSt));
+    s->cap = TAPE_INIT_SEC * (int)SR;
+    s->buf = calloc((size_t)s->cap * 2, sizeof(short));
+    s->rec = s->play = true;   // armed: patch something in and it echoes
+    strcpy(s->name, "EMPTY TAPE");
+    m->st = s;
+}
+
+static void tape_fini(Module *m)
+{
+    TapeSt *s = m->st;
+    if (!s) return;
+    free(s->buf); free(s->next); free(s->old);
+    s->buf = s->next = s->old = NULL;
+    s->cap = 0;
+}
+
+static int tape_len(const Module *m)
+{
+    const TapeSt *s = m->st;
+    return clampi((int)(m->p[0] * SR), 64, s->cap > 64 ? s->cap : 64);
+}
+
+static void tape_process(Module *m)
+{
+    TapeSt *s = m->st;
+    if (s->swap) {
+        s->old = s->buf;
+        s->buf = s->next; s->cap = s->nextCap; s->next = NULL;
+        if (!s->nextKeep) s->h = 0;
+        s->swap = 0;
+    }
+    float inL = IN(m, 0), inR = HAS(m, 1) ? IN(m, 1) : inL;
+    int L = tape_len(m);
+    float speed = m->p[1] * exp2f(IN(m, 4));
+    if (HAS(m, 3) && rising(IN(m, 3), &s->pplay)) { s->h = speed < 0 ? L - 1 : 0; s->play = true; }
+    bool rec = HAS(m, 2) ? IN(m, 2) > 0.5f : s->rec;
+    s->recNow = rec && s->play;
+    float mix = m->p[4], lvl = m->p[5];
+    if (!s->play || !s->buf) {
+        m->out[0] = inL * (1 - mix) * lvl;
+        m->out[1] = inR * (1 - mix) * lvl;
+        return;
+    }
+    if (s->h >= L) s->h = fmod(s->h, L);
+
+    // wow and flutter: read slightly ahead of the head by a wobbling amount
+    s->wph = fractf(s->wph + 0.43f / SR);
+    s->fph = fractf(s->fph + 6.1f / SR);
+    float off = 1 + m->p[3] * (60.0f * (1 + sinf(TAU * s->wph)) + 1.5f * (1 + sinf(TAU * s->fph)));
+    double rp = fmod(s->h + off, L);
+    int   i0 = (int)rp, i1 = (i0 + 1) % L;
+    float fr = (float)(rp - i0);
+    float wetL = (s->buf[2 * i0]     * (1 - fr) + s->buf[2 * i1]     * fr) / 32768.0f;
+    float wetR = (s->buf[2 * i0 + 1] * (1 - fr) + s->buf[2 * i1 + 1] * fr) / 32768.0f;
+
+    if (s->recNow) {   // tape saturation keeps endless overdubs bounded
+        int w = (int)s->h;
+        float fb = m->p[2];
+        s->buf[2 * w]     = (short)(tanhf(inL + fb * s->buf[2 * w]     / 32768.0f) * 32767.0f);
+        s->buf[2 * w + 1] = (short)(tanhf(inR + fb * s->buf[2 * w + 1] / 32768.0f) * 32767.0f);
+    }
+    s->h += speed;
+    if (s->h >= L) s->h -= L;
+    if (s->h < 0) s->h += L;
+    if (s->h < 0 || s->h >= L) s->h = 0;
+
+    m->out[0] = (inL * (1 - mix) + wetL * mix) * lvl;
+    m->out[1] = (inR * (1 - mix) + wetR * mix) * lvl;
+}
+
+// Hand a new buffer to the audio thread (UI thread only).
+static bool tape_handover(TapeSt *s, short *buf, int cap, bool keepHead)
+{
+    if (s->swap) { free(buf); return false; }
+    s->next = buf; s->nextCap = cap; s->nextKeep = keepHead;
+    s->swap = 1;
+    return true;
+}
+
+static bool tape_load(Module *m, const char *path)
+{
+    TapeSt *s = m->st;
+    Wave w = LoadWave(path);
+    if (!w.data || !w.frameCount) { toast(TextFormat("CANNOT READ %s", GetFileName(path))); return false; }
+    WaveFormat(&w, (int)SR, 16, 2);
+    int n = (int)w.frameCount;
+    if (n > TAPE_MAX_SEC * (int)SR) n = TAPE_MAX_SEC * (int)SR;
+    int cap = n > TAPE_INIT_SEC * (int)SR ? n : TAPE_INIT_SEC * (int)SR;
+    short *b = calloc((size_t)cap * 2, sizeof(short));
+    memcpy(b, w.data, (size_t)n * 2 * sizeof(short));
+    UnloadWave(w);
+    if (!tape_handover(s, b, cap, false)) return false;
+    m->p[0] = clampf(n / SR, DEFS[m->type].knobs[0].min, DEFS[m->type].knobs[0].max);
+    s->rec = false; s->play = true;
+    snprintf(s->name, sizeof s->name, "%s", GetFileName(path));
+    toast(TextFormat("LOADED %s (%.1f S)", GetFileName(path), n / SR));
+    return true;
+}
+
+static bool write_mp3(const char *path, const short *pcm, int frames)
+{
+    shine_config_t cfg;
+    shine_set_config_mpeg_defaults(&cfg.mpeg);
+    cfg.wave.channels = PCM_STEREO;
+    cfg.wave.samplerate = (int)SR;
+    cfg.mpeg.mode = JOINT_STEREO;
+    cfg.mpeg.bitr = 192;
+    if (shine_check_config(cfg.wave.samplerate, cfg.mpeg.bitr) < 0) return false;
+    shine_t enc = shine_initialise(&cfg);
+    if (!enc) return false;
+    FILE *f = fopen(path, "wb");
+    if (!f) { shine_close(enc); return false; }
+    int spp = shine_samples_per_pass(enc), written;
+    int16_t *chunk = calloc((size_t)spp * 2, sizeof(int16_t));
+    for (int pos = 0; pos < frames; pos += spp) {
+        int n = frames - pos < spp ? frames - pos : spp;
+        memset(chunk, 0, (size_t)spp * 2 * sizeof(int16_t));
+        memcpy(chunk, pcm + 2 * (size_t)pos, (size_t)n * 2 * sizeof(int16_t));
+        unsigned char *data = shine_encode_buffer_interleaved(enc, chunk, &written);
+        fwrite(data, 1, written, f);
+    }
+    unsigned char *data = shine_flush(enc, &written);
+    fwrite(data, 1, written, f);
+    shine_close(enc);
+    free(chunk);
+    return fclose(f) == 0;
+}
+
+#if defined(PLATFORM_WEB)
+#define EXPORT_DIR "/tmp"
+#else
+#define EXPORT_DIR "raya-data/recordings"
+#endif
+
+static void tape_export(Module *m, bool mp3)
+{
+    TapeSt *s = m->st;
+    int L = tape_len(m);
+    char stamp[32], path[256];
+    time_t now = time(NULL);
+    strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", localtime(&now));
+    MakeDirectory(EXPORT_DIR);
+    snprintf(path, sizeof path, "%s/raya-tape-%s.%s", EXPORT_DIR, stamp, mp3 ? "mp3" : "wav");
+    bool ok;
+    if (mp3) ok = write_mp3(path, s->buf, L);
+    else {
+        Wave w = { .frameCount = (unsigned int)L, .sampleRate = (unsigned int)SR, .sampleSize = 16, .channels = 2, .data = s->buf };
+        ok = ExportWave(w, path);
+    }
+    if (!ok) { toast("COULD NOT WRITE THE AUDIO FILE"); return; }
+#if defined(PLATFORM_WEB)
+    emscripten_run_script(TextFormat("rayaDownload('%s')", path));
+#endif
+    toast(TextFormat("SAVED %s (%.1f S)", GetFileName(path), L / SR));
+}
+
+static Rectangle tape_wave_rect(Rectangle a) { return (Rectangle){ a.x, a.y, a.width, a.height - 28 }; }
+static Rectangle tape_btn(Rectangle a, int i)
+{
+    float bw = (a.width - (TAPE_BTN_N - 1) * 4) / TAPE_BTN_N;
+    return (Rectangle){ a.x + i * (bw + 4), a.y + a.height - 22, bw, 22 };
+}
+
+static void tape_draw(Module *m, Rectangle a)
+{
+    TapeSt *s = m->st;
+    // housekeeping on the UI thread: free retired buffers, grow the tape for TIME
+    if (!s->swap && s->old) { free(s->old); s->old = NULL; }
+    int want = clampi((int)(m->p[0] * SR), 64, TAPE_MAX_SEC * (int)SR);
+    if (!s->swap && want > s->cap) {
+        int cap = want + 8 * (int)SR < TAPE_MAX_SEC * (int)SR ? want + 8 * (int)SR : TAPE_MAX_SEC * (int)SR;
+        short *b = calloc((size_t)cap * 2, sizeof(short));
+        memcpy(b, s->buf, (size_t)s->cap * 2 * sizeof(short));
+        tape_handover(s, b, cap, true);
+    }
+
+    Rectangle wr = tape_wave_rect(a);
+    DrawRectangleRec(wr, INSET);
+    int L = tape_len(m), cols = (int)wr.width - 4;
+    float mid = wr.y + wr.height / 2 + 5, amp = (wr.height - 16) / 2;
+    float headX = wr.x + 2 + (float)(s->h / L) * cols;
+    for (int c = 0; c < cols && s->buf; c++) {
+        int f0 = (int)((long long)c * L / cols), f1 = (int)((long long)(c + 1) * L / cols);
+        int step = (f1 - f0) / 24 + 1;
+        float pk = 0;
+        for (int f = f0; f < f1; f += step) {
+            float v = fmaxf(fabsf(s->buf[2 * f] / 32768.0f), fabsf(s->buf[2 * f + 1] / 32768.0f));
+            if (v > pk) pk = v;
+        }
+        float h = fmaxf(1, sqrtf(pk) * amp);
+        float x = wr.x + 2 + c;
+        DrawLineV((Vector2){ x, mid - h }, (Vector2){ x, mid + h }, fade(PHOSPHOR, x < headX ? 0.55f : 0.3f));
+    }
+    Color hc = s->recNow ? CABLE_COLORS[1] : ACCENT;
+    DrawLineEx((Vector2){ headX, wr.y + 14 }, (Vector2){ headX, wr.y + wr.height - 2 }, 1.5f, hc);
+    char nm[48];
+    snprintf(nm, sizeof nm, "%s", s->name);
+    for (int n = (int)strlen(nm); n > 3 && txt_w(nm, 10) > wr.width * 0.6f; n--) strcpy(nm + n - 4, "...");
+    txt(nm, wr.x + 6, wr.y + 4, 10, TEXT_DIM);
+    const char *t = TextFormat("%.1f / %.1f S", s->h / SR, L / SR);
+    txt(t, wr.x + wr.width - 6 - txt_w(t, 10), wr.y + 4, 10, TEXT_DIM);
+    if (s->recNow && fmodf((float)GetTime(), 1.0f) < 0.6f) DrawCircleV((Vector2){ wr.x + wr.width - 14 - txt_w(t, 10), wr.y + 9 }, 3, CABLE_COLORS[1]);
+
+    for (int i = 0; i < TAPE_BTN_N; i++) {
+        Rectangle b = tape_btn(a, i);
+        bool on = (i == 0 && s->rec) || (i == 1 && s->play);
+        Color c = i == 0 ? CABLE_COLORS[1] : ACCENT;
+        bool hov = CheckCollisionPointRec(GetMousePosition(), b);
+        DrawRectangleRec(b, on ? fade(c, 0.18f) : (hov ? PANEL_HI : INSET));
+        DrawRectangleLinesEx(b, 1, on ? c : PANEL_HI);
+        txt_c(TAPE_BTN[i], b.x + b.width / 2, b.y + 6, 10, on ? c : (hov ? TEXT : TEXT_DIM));
+    }
+}
+
+static bool tape_press(Module *m, Vector2 mp, Rectangle a)
+{
+    TapeSt *s = m->st;
+    if (!CheckCollisionPointRec(mp, a)) return false;
+    s->scrub = false;
+    for (int i = 0; i < TAPE_BTN_N; i++) {
+        if (!CheckCollisionPointRec(mp, tape_btn(a, i))) continue;
+        switch (i) {
+        case 0: s->rec = !s->rec; break;
+        case 1: s->play = !s->play; break;
+        case 2:
+#if defined(PLATFORM_WEB)
+            g_pickTarget = (int)(m - mods);
+            emscripten_run_script("rayaPickFile()");
+#else
+            toast("DROP AN AUDIO FILE ONTO THE TAPE TO LOAD IT");
+#endif
+            break;
+        case 3: tape_export(m, false); break;
+        case 4: tape_export(m, true); break;
+        case 5:
+            if (s->buf) memset(s->buf, 0, (size_t)s->cap * 2 * sizeof(short));
+            strcpy(s->name, "EMPTY TAPE");
+            break;
+        }
+        return true;
+    }
+    Rectangle wr = tape_wave_rect(a);
+    if (CheckCollisionPointRec(mp, wr)) {   // click the tape to move the head
+        s->scrub = true;
+        s->h = clampf((mp.x - wr.x - 2) / (wr.width - 4), 0, 0.999f) * tape_len(m);
+        return true;
+    }
+    return false;
+}
+
+static void tape_drag(Module *m, Vector2 mp, Rectangle a)
+{
+    TapeSt *s = m->st;
+    Rectangle wr = tape_wave_rect(a);
+    if (s->scrub) s->h = clampf((mp.x - wr.x - 2) / (wr.width - 4), 0, 0.999f) * tape_len(m);
+}
+
+static void tape_save(const Module *m, char *out, int cap)
+{
+    const TapeSt *s = m->st;
+    snprintf(out, cap, "%d %d", s->rec, s->play);
+}
+
+static void tape_load_data(Module *m, const char *str)
+{
+    TapeSt *s = m->st;
+    int rec, play;
+    if (sscanf(str, "%d %d", &rec, &play) == 2) { s->rec = rec != 0; s->play = play != 0; }
+}
+
+// ---------------------------------------------------------------------------
 // Module registry
 // ---------------------------------------------------------------------------
 
@@ -804,12 +1108,17 @@ static const ModDef DEFS[M_COUNT] = {
     [M_OUT] = { "OUTPUT", 236, 76, 2, 0, 1, { "L", "R" }, {0},
         { { "VOLUME", 0, 1.5f, 0.8f, K_KNOB, F_PCT } },
         out_init, out_process, out_draw, NULL, NULL },
+    [M_TAPE] = { "TAPE", 412, 92, 5, 2, 6, { "IN L", "IN R", "REC", "PLAY", "SPEED" }, { "L", "R" },
+        { { "TIME", 0.1f, TAPE_MAX_SEC, 6, K_EXP, F_SEC },  { "SPEED", -2, 2, 1, K_KNOB, F_NUM },
+          { "FEEDBACK", 0, 1, 0.6f, K_KNOB, F_PCT },        { "WOW", 0, 1, 0.3f, K_KNOB, F_PCT },
+          { "MIX", 0, 1, 0.5f, K_KNOB, F_PCT },             { "LEVEL", 0, 1, 0.8f, K_KNOB, F_PCT } },
+        tape_init, tape_process, tape_draw, tape_press, tape_drag, tape_save, tape_load_data, tape_fini },
 };
 
 // Stable ids used in preset files.
 static const char *MOD_ID[M_COUNT] = {
     [M_CLOCK] = "clock", [M_SEQ] = "seq", [M_CHORD] = "chords", [M_OSC3] = "osc3",
-    [M_LFO] = "lfo", [M_REVERB] = "reverb", [M_OUT] = "output",
+    [M_LFO] = "lfo", [M_REVERB] = "reverb", [M_OUT] = "output", [M_TAPE] = "tape",
 };
 
 // ---------------------------------------------------------------------------
@@ -954,6 +1263,7 @@ static int add_module(int type, float x, float y)
     for (int i = 0; i < MAX_MODULES; i++) {
         Module *m = &mods[i];
         if (m->alive) continue;
+        if (m->st && DEFS[m->type].fini) DEFS[m->type].fini(m);
         free(m->st);
         memset(m, 0, sizeof *m);
         m->type = type;
@@ -980,6 +1290,7 @@ static void remove_module(int i)
     for (int c = ncables - 1; c >= 0; c--)
         if (cables[c].fm == i || cables[c].tm == i) remove_cable(c);
     rebuild_routing();
+    if (DEFS[mods[i].type].fini) DEFS[mods[i].type].fini(&mods[i]);   // e.g. release tape memory now
 }
 
 static void add_cable(int fm, int fo, int tm, int ti, int color)
@@ -1426,6 +1737,22 @@ static const struct { const char *name, *body; } FACTORY[] = {
       "knob SIZE 1.9\nknob DECAY 40\nknob DAMP 0.55\nknob MIX 0.75\n"
       "module output 260 0\n"
       "cable 0 0 1 0 0\ncable 0 1 1 1 0\n" },
+    // new factory presets go at the end: existing racks receive them by index
+    { "tape echo swells",
+      "module clock 0 0\n"
+      "knob BPM 70\n"
+      "module seq 256 0\n"
+      "knob CHANCE 0.6\n"
+      "module osc3 0 300\n"
+      "knob WAVE 0.3\nknob CUTOFF 1400\nknob ATTACK 0.3\nknob RELEASE 3\nknob MOD_AMT 0.6\n"
+      "module tape 436 300\n"
+      "knob TIME 2.57\nknob FEEDBACK 0.7\nknob WOW 0.5\nknob MIX 0.45\n"
+      "data 1 1\n"
+      "module reverb 872 300\n"
+      "module output 1132 300\n"
+      "cable 0 1 1 0 3\ncable 1 0 2 3 1\ncable 1 1 2 4 2\n"
+      "cable 2 0 3 0 4\ncable 2 1 3 1 4\ncable 3 0 4 0 0\ncable 3 1 4 1 0\n"
+      "cable 4 0 5 0 2\ncable 4 1 5 1 2\n" },
 };
 #define N_FACTORY ((int)(sizeof FACTORY / sizeof FACTORY[0]))
 
@@ -1448,11 +1775,17 @@ static void rack_load(void)
         if (text) rack_put(slot - 1, fn, text);
     }
     UnloadDirectoryFiles(fl);
+    // .seeded records how many factory presets this rack has received, so
+    // presets added in later versions arrive without re-adding deleted ones.
     const char *seeded = PRESET_DIR "/.seeded";
-    if (!FileExists(seeded)) {
+    int have = 0;
+    char *mark = read_file(seeded);
+    if (mark && sscanf(mark, "factory %d", &have) != 1) have = 10;   // first versions wrote no count
+    free(mark);
+    if (have < N_FACTORY) {
         fs_hold = true;
-        for (int i = 0; i < N_FACTORY; i++) rack_store(FACTORY[i].name, factory_text(i));
-        write_file(seeded, "factory presets installed\n");
+        for (int i = have; i < N_FACTORY; i++) rack_store(FACTORY[i].name, factory_text(i));
+        write_file(seeded, TextFormat("factory %d\n", N_FACTORY));
         fs_hold = false;
         fs_sync();
     }
@@ -1633,7 +1966,7 @@ static struct {
     double  toastT;
 } ui = { .lastKnobMod = -1, .toastT = -10 };
 
-static const int MENU_ORDER[M_COUNT] = { M_CLOCK, M_LFO, M_SEQ, M_CHORD, M_OSC3, M_REVERB, M_OUT };
+static const int MENU_ORDER[M_COUNT] = { M_CLOCK, M_LFO, M_SEQ, M_CHORD, M_OSC3, M_TAPE, M_REVERB, M_OUT };
 #define MENU_W 160
 #define MENU_ITEM_H 24
 #define MENU_N (M_COUNT + 1)   // modules + "PRESET RACK..."
@@ -2130,6 +2463,39 @@ static void draw_save(Vector2 mp)
 }
 
 // ---------------------------------------------------------------------------
+// Audio files arriving from the file picker or by drag and drop
+// ---------------------------------------------------------------------------
+
+static void handle_audio_files(Vector2 mp)
+{
+#if defined(PLATFORM_WEB)
+    if (g_pickTarget >= 0) {
+        const char *path = emscripten_run_script_string("rayaTakePicked()");
+        if (path[0]) {
+            Module *m = &mods[g_pickTarget];
+            if (m->alive && m->type == M_TAPE) tape_load(m, path);
+            remove(path);
+            g_pickTarget = -1;
+        }
+    }
+#endif
+    if (!IsFileDropped()) return;
+#if defined(PLATFORM_WEB)
+    mp = (Vector2){ (float)emscripten_run_script_int("Module.rayaDropX | 0"), (float)emscripten_run_script_int("Module.rayaDropY | 0") };
+#endif
+    FilePathList dropped = LoadDroppedFiles();
+    int target = module_at(mp);
+    if (target >= 0 && mods[target].type != M_TAPE) target = -1;
+    for (unsigned int i = 0; i < dropped.count; i++) {
+        int t = target;
+        if (t < 0 || i > 0)   // dropped on empty space: a new tape for each file
+            t = add_module(M_TAPE, mp.x - pan.x + i * 24, mp.y - pan.y + i * 24);
+        if (t >= 0) tape_load(&mods[t], dropped.paths[i]);
+    }
+    UnloadDroppedFiles(dropped);
+}
+
+// ---------------------------------------------------------------------------
 // Frame
 // ---------------------------------------------------------------------------
 
@@ -2145,6 +2511,7 @@ static void frame(void)
     }
 #endif
     if (!rack_ready && fs_ready()) rack_load();
+    handle_audio_files(GetMousePosition());
     handle_input();
     Vector2 mp = GetMousePosition();
     Minimap mm = minimap();
@@ -2189,7 +2556,7 @@ static void frame(void)
     draw_minimap(ui.modal || ui.menu ? (Vector2){ -1, -1 } : mp);
     int ns = selection_count();
     if (ns) draw_button(btn_save(), TextFormat("SAVE %d MODULE%s AS PRESET", ns, ns == 1 ? "" : "S"), bmp, true);
-    txt("DRAG JACK TO JACK: PATCH   RIGHT-CLICK JACK: UNPLUG   RIGHT-CLICK SPACE: ADD   DRAG SPACE: PAN   SHIFT-DRAG SPACE: SELECT   P: PRESETS   S: SAVE SELECTION   DOUBLE-CLICK KNOB: RESET",
+    txt("DRAG JACK TO JACK: PATCH   RIGHT-CLICK JACK: UNPLUG   RIGHT-CLICK SPACE: ADD   DRAG SPACE: PAN   SHIFT-DRAG SPACE: SELECT   DROP AUDIO FILE: TAPE   P: PRESETS   S: SAVE SELECTION   DOUBLE-CLICK KNOB: RESET",
         18, GetScreenHeight() - 22, 10, fade(TEXT_DIM, 0.8f));
 
     if (ui.menu) {

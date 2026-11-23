@@ -13,6 +13,50 @@
   <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
   <script>
     var Module = { canvas: document.getElementById('canvas') };
+
+    // TAPE: pick an audio file; raya.c polls rayaTakePicked() for its path.
+    function rayaPickFile() {
+      var input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.wav,.mp3,.ogg,.flac,.qoa,audio/*';
+      input.onchange = function () {
+        var f = input.files[0];
+        if (!f) return;
+        f.arrayBuffer().then(function (buf) {
+          try { FS.mkdir('/tmp/raya-in'); } catch (e) {}
+          var path = '/tmp/raya-in/' + f.name.replace(/[^A-Za-z0-9._-]/g, '_');
+          FS.writeFile(path, new Uint8Array(buf));
+          Module.rayaPicked = path;
+        });
+      };
+      input.click();
+    }
+    function rayaTakePicked() {
+      var p = Module.rayaPicked || '';
+      Module.rayaPicked = '';
+      return p;
+    }
+
+    // TAPE: where a file is being dropped (no mouse events fire during a drag).
+    Module.canvas.addEventListener('dragover', function (e) {
+      var c = Module.canvas, r = c.getBoundingClientRect();   // same mapping GLFW uses for the mouse
+      Module.rayaDropX = Math.round((e.clientX - r.left) * c.width / r.width);
+      Module.rayaDropY = Math.round((e.clientY - r.top) * c.height / r.height);
+    });
+
+    // TAPE: hand an exported file from the in-memory file system to the browser.
+    function rayaDownload(path) {
+      var name = path.split('/').pop();
+      var blob = new Blob([FS.readFile(path)], { type: /\.mp3$/.test(name) ? 'audio/mpeg' : 'audio/wav' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(function () { URL.revokeObjectURL(a.href); }, 30000);
+      FS.unlink(path);
+    }
   </script>
   {{{ SCRIPT }}}
 </body>
