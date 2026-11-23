@@ -381,6 +381,7 @@ static const char *PROGRESSIONS[] = {
     "Bbmaj7 Ebmaj7",         "C Ab Bb C",             "Am Fmaj7 Dm7 E7",       "F Am Bb C",
     "G Bm C Cm",             "C E Am F",              "Dbmaj7 Cm7 Bbm7 Abmaj7", "Cm7 Fm7 Abmaj7 G7",
     "Gm9 Cm9 Ebmaj7 D7sus4", "Em7 A7 Dmaj7 Bm7",      "Fmaj7 Am7 Dm7 Bbmaj7",  "C Fm6 C Fm6",
+    "Emaj7 C#m7 G#m7 C#m7",  // from the electro 128 reference track
 };
 #define NPROG ((int)(sizeof PROGRESSIONS / sizeof PROGRESSIONS[0]))
 
@@ -3830,7 +3831,7 @@ static const struct { const char *name, *body; } FACTORY[] = {
     { "electro 128",
       "module clock 0 0\nknob BPM 128\n"
       "module arranger 256 0\nknob GLIDE 6\ndata 24:0.250:00000000 16:0.400:10010000 16:0.550:11101000 8:0.800:00000100 32:0.350:00000100 16:0.600:00001100 32:0.900:11001101 16:1.000:10011001 32:0.700:10101000 24:0.750:01101010 16:0.250:00010000 0:0.000:00000000\n"
-      "module chords 840 0\nknob PROG 52\nknob CHORD_LEN 0\nknob TRANSPOSE -1\n"
+      "module chords 840 0\nknob PROG 92\nknob CHORD_LEN 0\n"
       "module arp 1236 0\nknob MODE 0\nknob OCTAVES 2\nknob DIVIDE 2\nknob GATE 0.4\nknob CHANCE 0.9\n"
       "module seq 0 420\nknob CHANCE 1\nknob GLIDE 0\ndata 0:0.500 0:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 0:0.500 1:0.500 0:0.500 0:0.500 0:0.500\n"
       "module seq 412 420\nknob CHANCE 0.95\nknob GLIDE 0\ndata 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500 1:0.500 0:0.500\n"

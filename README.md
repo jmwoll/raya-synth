@@ -24,7 +24,7 @@ natively, and the door stays open to turn it into a VST plugin.
 | --- | --- |
 | CLOCK | Tempo in BPM; pulses on 1/16, beat, bar and every 4 bars. |
 | SEQUENCER | 16 steps, each with on/off and a value. Outputs GATE and CV. Length, chance (random step skipping) and glide. Runs on its own clock when unpatched. |
-| CHORDS | 92 common progressions (e.g. `Fmaj7 Am C G`). A new chord every 1x/2x/4x/8x clock pulses. Outputs four voiced chord notes, a bass note and an ARP note picked by the ARP input. |
+| CHORDS | 92 common progressions (e.g. `Fmaj7 Am C G`), plus #93 `Emaj7 C#m7 G#m7 C#m7` from the electro 128 reference. A new chord every 1x/2x/4x/8x clock pulses. Outputs four voiced chord notes, a bass note and an ARP note picked by the ARP input. |
 | ARPEGGIATOR | Arpeggiates the chord tones patched into N1–N4 (e.g. from CHORDS) over 1–4 octaves: up, down, up-down, down-up, random, walk, converge, diverge or as played. Divide, gate length and chance per step. Plays A minor 7 when nothing is patched. |
 | PERFORMER | Plays solo phrases in any of the 12 keys (see below). |
 | 3X OSC | Three detuned oscillator pairs (sine → triangle → saw), filter, swell envelope, stereo. Pitches from P1–P3, swells on GATE, a drone when GATE is unpatched. |
