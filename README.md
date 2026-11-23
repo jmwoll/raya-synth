@@ -84,7 +84,13 @@ There are 16 kits: **808, 909, 707, 606, CR-78, 303 GROOVE, 404 DUST, LM DRUM, D
 - **Checked against references:** measured against documented behaviour, for example the 808 kick settling at 49 Hz, its cowbell at 540 and 800 Hz, and the 909 kick sweeping from about 250 Hz.
 - **Knobs:** **KIT**, **TUNE** (±12 semitones), **DECAY** (shortens every sound), **TONE** (darker ↔ thinner), **DRIVE** and **LEVEL**.
 
-The factory presets *808 groove* and *dusty vinyl beat* drive DRUMS from three sequencers.
+The factory presets *808 groove* and *dusty vinyl beat* drive DRUMS from three sequencers. To get every sound as a WAV file, run `make drum-samples`. It writes `drum-samples/<kit>/01-kick-1.wav` … `16-….wav` (48 kHz, 16-bit, mono).
+
+**About these sounds:**
+- **Who made them:** the drum sounds were created by Claude Opus 5.5, an AI model by Anthropic. It worked from rough, general descriptions of each machine's hardware characteristics: how its circuits or sample chips shape a kick, a snare, a hi-hat, and so on.
+- **Clean-room reimplementations:** nothing was sampled from real hardware, and no recordings or samples from anywhere else were used. Every sound is synthesized by the code in `raya.c`.
+- **Approximations:** they are rough implementations of how these drum kits approximately sound, not copies of the originals.
+- **Names:** names such as 808, 909 or LM DRUM only describe the style being approximated.
 
 ## Sampler
 

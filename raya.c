@@ -1776,6 +1776,12 @@ static void voice_run(Voice *v, float *L, float *R, float decayTau)
 // style generators (pitch-swept sines, tuned noise, the 808's six square
 // oscillators, inharmonic partials, a chip LFSR), then given its character:
 // sample rate, bit depth, 8-bit companding, saturation, tape and vinyl.
+//
+// These sounds were created by Claude Opus 5.5 (Anthropic) from rough, general
+// descriptions of each machine's hardware characteristics. They are clean-room
+// reimplementations: nothing was sampled from real hardware or taken from any
+// recording or sample set; they only approximate how such drum kits sound.
+// Kit names describe the style being approximated.
 // ---------------------------------------------------------------------------
 
 enum { BQ_LP, BQ_HP, BQ_BP };

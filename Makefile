@@ -4,6 +4,7 @@
 #                build them for the web
 #   make         build build/index.html (+ .js/.wasm)
 #   make serve   serve build/ at http://localhost:8080
+#   make drum-samples   render every DRUMS kit to WAV files in drum-samples/
 
 RAYLIB_VERSION ?= 5.5
 SHINE_COMMIT   ?= ab5e352
@@ -30,7 +31,7 @@ LDFLAGS := $(RAYLIB)/libraylib.a $(SHINE)/libshine.a -sUSE_GLFW=3 -sALLOW_MEMORY
            -sEXPORTED_RUNTIME_METHODS=HEAPF32 -sSTACK_SIZE=1048576 \
            -sFORCE_FILESYSTEM=1 -lidbfs.js --shell-file shell.html
 
-.PHONY: all deps serve clean
+.PHONY: all deps serve clean drum-samples
 
 all: $(BUILD)/index.html
 
@@ -57,6 +58,16 @@ deps:
 	        CC=$(abspath $(EMCC)) AR=$(abspath $(EMAR)) CUSTOM_CFLAGS=-DSUPPORT_FILEFORMAT_FLAC=1 -j8
 	test -d $(SHINE) || (git clone https://github.com/toots/shine.git $(SHINE) && git -C $(SHINE) checkout -q $(SHINE_COMMIT))
 	$(MAKE) $(SHINE)/libshine.a
+
+# The drum kits are synthesized by raya.c; this writes them out as WAV files
+# with a native compiler (raylib stays unlinked, only the synthesis runs).
+comma := ,
+UNRESOLVED := $(if $(filter Darwin,$(shell uname -s)),-Wl$(comma)-undefined$(comma)dynamic_lookup,-Wl$(comma)--unresolved-symbols=ignore-all)
+
+drum-samples: tools/render_drums.c raya.c
+	@mkdir -p $(BUILD)
+	cc -O2 -std=c99 -w -I$(RAYLIB) -I$(SHINE)/src/lib tools/render_drums.c -o $(BUILD)/render_drums $(UNRESOLVED) -lm
+	$(BUILD)/render_drums drum-samples
 
 serve: all
 	cd $(BUILD) && $(EMSDK_PYTHON) -m http.server $(PORT)
