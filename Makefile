@@ -5,10 +5,14 @@
 #                build them for the web
 #   make         build build/index.html (+ .js/.wasm)
 #   make serve   serve build/ at http://localhost:8080
+#   make gh_page build and publish the web app on the gh-pages branch
 
 RAYLIB_VERSION ?= 5.5
 SHINE_COMMIT   ?= ab5e352
 PORT           ?= 8080
+# where the gh-pages branch is checked out, and PUSH=0 to commit without pushing
+PAGES          ?= ../raya-pages
+PUSH           ?= 1
 
 DEPS   := deps
 EMSDK  := $(DEPS)/emsdk
@@ -31,7 +35,7 @@ LDFLAGS := $(RAYLIB)/libraylib.a $(SHINE)/libshine.a -sUSE_GLFW=3 -sALLOW_MEMORY
            -sEXPORTED_RUNTIME_METHODS=HEAPF32 -sSTACK_SIZE=1048576 \
            -sFORCE_FILESYSTEM=1 -lidbfs.js --shell-file shell.html
 
-.PHONY: all deps serve clean
+.PHONY: all deps serve clean gh_page
 
 all: $(BUILD)/index.html
 
@@ -61,6 +65,25 @@ deps:
 
 serve: all
 	cd $(BUILD) && $(EMSDK_PYTHON) -m http.server $(PORT)
+
+# GitHub Pages ("Deploy from a branch", branch gh-pages, folder / (root)).
+# The gh-pages branch lives in its own worktree beside the project, so main is
+# never touched. The first run reuses a local or remote gh-pages branch, or
+# starts an empty one. Only the web build and the license files are published.
+PAGE_FILES := $(BUILD)/index.html $(BUILD)/index.js $(BUILD)/index.wasm LICENSE THIRD-PARTY-NOTICES.md
+
+gh_page: all
+	@test -d $(PAGES) \
+	  || (git show-ref --verify --quiet refs/heads/gh-pages && git worktree add $(PAGES) gh-pages) \
+	  || (git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1 && git fetch origin gh-pages:gh-pages && git worktree add $(PAGES) gh-pages) \
+	  || git worktree add --orphan -b gh-pages $(PAGES)
+	cp $(PAGE_FILES) $(PAGES)/
+	touch $(PAGES)/.nojekyll
+	git -C $(PAGES) add -A
+	git -C $(PAGES) diff --cached --quiet \
+	  || git -C $(PAGES) commit -q -m "Publish raya web build from $$(git rev-parse --short HEAD)"
+	@if [ "$(PUSH)" = 1 ]; then git -C $(PAGES) push -u origin gh-pages; \
+	 else echo "gh-pages is up to date in $(PAGES), not pushed (PUSH=0)"; fi
 
 clean:
 	rm -rf $(BUILD)

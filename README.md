@@ -168,6 +168,7 @@ The rack holds up to 2048 presets (`PRESET_MAX`). Each one is a small text file,
 ```bash
 make deps   # once: fetch Emscripten, raylib and shine into deps/
 make serve  # build and serve at http://localhost:8080
+make gh_page  # build and publish to the gh-pages branch (GitHub Pages)
 ```
 
 MP3 export uses [shine](https://github.com/toots/shine), a small fixed-point MP3 encoder licensed under the LGPL-2.0. Decoding (WAV, MP3, OGG, FLAC, QOA) comes with raylib.
