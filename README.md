@@ -25,6 +25,8 @@ natively, and the door stays open to turn it into a VST plugin.
 | CLOCK | Tempo in BPM; pulses on 1/16, beat, bar and every 4 bars. |
 | SEQUENCER | 16 steps, each with on/off and a value. Outputs GATE and CV. Length, chance (random step skipping) and glide. Runs on its own clock when unpatched. |
 | CHORDS | 92 common progressions (e.g. `Fmaj7 Am C G`). A new chord every 1x/2x/4x/8x clock pulses. Outputs four voiced chord notes, a bass note and an ARP note picked by the ARP input. |
+| ARPEGGIATOR | Arpeggiates the chord tones patched into N1–N4 (e.g. from CHORDS) over 1–4 octaves: up, down, up-down, down-up, random, walk, converge, diverge or as played. Divide, gate length and chance per step. Plays A minor 7 when nothing is patched. |
+| PERFORMER | Plays solo phrases in any of the 12 keys (see below). |
 | 3X OSC | Three detuned oscillator pairs (sine → triangle → saw), filter, swell envelope, stereo. Pitches from P1–P3, swells on GATE, a drone when GATE is unpatched. |
 | LFO | Slow sine, triangle, smooth drift and sample-and-hold for modulation. |
 | TAPE | A tape loop that plays, records and overdubs (see below). |
@@ -34,6 +36,27 @@ natively, and the door stays open to turn it into a VST plugin.
 Pitch cables carry octaves relative to C4; gates and modulation carry 0..1. Several cables into one input are summed.
 
 **Playing:** raya starts with a patch that already sounds: chords from CHORDS into 3X OSC, through REVERB to OUTPUT, with the LFO on the filter and the sequencer morphing the waveform. Click once to unlock audio in the browser. Drag from jack to jack to patch. Right-click a jack to unplug it. Right-click empty space to add a module. Drag empty space to pan; the overview in the top-right corner shows the whole patch, and clicking or dragging in it jumps there. Drag knobs vertically (Shift = fine), use the mouse wheel, double-click to reset.
+
+## Performer
+
+PERFORMER plays solo lines the way a player would in blues, jazz, rock or pop, slowed down to sit inside an ambient piece. It has 192 phrases:
+
+| Phrases | Written for |
+| --- | --- |
+| 1–32 | Minor pentatonic: calls, answers and sighs |
+| 33–64 | Major pentatonic: open, hopeful lines |
+| 65–96 | Minor blues, with the ♭5 blue note |
+| 97–112 | Major blues, with the ♭3 and ♭7 |
+| 113–128 | Minor pentatonic long tones with wide space |
+| 129–192 | Modes: Ionian, Dorian, Phrygian, Lydian, Mixolydian, Aeolian, Locrian |
+
+- **KEY** picks the key, and **SCALE** the scale: *AUTO* (the scale the phrase was written for), minor/major pentatonic, minor/major blues, or any of the seven modes. Phrases are written in scale degrees, so each one works in every key; in a different scale, its notes are fitted to that scale.
+- One phrase step lasts one clock pulse, so patch CLOCK 1/16 for flowing lines or BEAT for very slow ones. With CLOCK unpatched it runs on its own.
+- **SPACE** adds pulses of silence before the phrase repeats. **VARY** lets the player leave notes out, step to a neighbouring note or jump an octave. **GATE** sets how legato it plays.
+- **ROOT** takes a pitch, for example CHORDS BASS, and moves the key to that note, so the line follows the chord changes.
+- Some phrases slide into notes.
+
+The factory presets *chord arpeggio* and *pentatonic performer* show both modules in a patch.
 
 ## Tape
 

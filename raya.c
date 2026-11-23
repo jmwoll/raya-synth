@@ -99,14 +99,14 @@ static const char *NOTE_NAMES[12] = { "C","C#","D","D#","E","F","F#","G","G#","A
 // ---------------------------------------------------------------------------
 
 enum { K_KNOB, K_EXP, K_STEP, K_SEG };
-enum { F_NUM, F_INT, F_HZ, F_SEC, F_BPM, F_SEMI, F_PCT, F_PROG, F_OCT };
+enum { F_NUM, F_INT, F_HZ, F_SEC, F_BPM, F_SEMI, F_PCT, F_PROG, F_OCT, F_LABEL };
 
 typedef struct {
     const char  *name;
     float        min, max, def;
     int          kind;
     int          fmt;
-    const char **labels;   // K_SEG
+    const char **labels;   // K_SEG, F_LABEL
 } KnobDef;
 
 typedef struct Module Module;
@@ -151,7 +151,7 @@ static bool   sel[MAX_MODULES];   // selected in the UI
 static volatile int g_route;  // routing copy the audio thread should use
 static int    g_cur;          // routing copy used during the current audio block
 
-enum { M_CLOCK, M_SEQ, M_CHORD, M_OSC3, M_LFO, M_REVERB, M_OUT, M_TAPE, M_COUNT };
+enum { M_CLOCK, M_SEQ, M_CHORD, M_OSC3, M_LFO, M_REVERB, M_OUT, M_TAPE, M_ARP, M_PERF, M_COUNT };
 static const ModDef DEFS[M_COUNT];
 
 static float IN(Module *m, int i)
@@ -1077,6 +1077,456 @@ static void tape_load_data(Module *m, const char *str)
 }
 
 // ---------------------------------------------------------------------------
+// ARP — arpeggiates the chord tones patched into N1..N4 (e.g. from CHORDS)
+// ---------------------------------------------------------------------------
+
+enum { ARP_UP, ARP_DOWN, ARP_UPDOWN, ARP_DOWNUP, ARP_RANDOM, ARP_WALK, ARP_CONVERGE, ARP_DIVERGE, ARP_PLAYED, ARP_NMODES };
+static const char *ARP_MODES[ARP_NMODES] = { "UP", "DOWN", "UP-DOWN", "DOWN-UP", "RANDOM", "WALK", "CONVERGE", "DIVERGE", "AS PLAYED" };
+
+#define ARP_POOL 16
+
+typedef struct {
+    int   step, cnt, walk, cur;
+    float pclk, prst, iph;
+    int   since, period, gateLeft, gap;
+    float note;
+    float pool[ARP_POOL];
+    int   npool;
+} ArpSt;
+
+static void arp_init(Module *m)
+{
+    ArpSt *s = calloc(1, sizeof(ArpSt));
+    s->period = (int)(SR * 0.4f);
+    s->note = -0.25f;   // A3
+    s->cur = -1;
+    m->st = s;
+}
+
+// Chord tones (sorted unless AS PLAYED), spread over OCTAVES.
+static int arp_pool(Module *m, float *pool)
+{
+    float base[4];
+    int k = 0;
+    for (int i = 0; i < 4; i++) if (HAS(m, i)) base[k++] = IN(m, i);
+    if (!k) {   // nothing patched: A minor 7
+        static const int def[4] = { 57, 60, 64, 67 };
+        for (int i = 0; i < 4; i++) base[k++] = (def[i] - 60) / 12.0f;
+    }
+    if ((int)roundf(m->p[0]) != ARP_PLAYED)
+        for (int i = 1; i < k; i++)
+            for (int j = i; j > 0 && base[j] < base[j - 1]; j--) { float t = base[j]; base[j] = base[j - 1]; base[j - 1] = t; }
+    int oct = clampi((int)roundf(m->p[1]), 1, 4), n = 0;
+    for (int o = 0; o < oct; o++)
+        for (int i = 0; i < k; i++) pool[n++] = base[i] + o;
+    return n;
+}
+
+static int arp_index(int mode, int i, int n, int *walk)
+{
+    if (n <= 1) return 0;
+    int p = i % n;
+    switch (mode) {
+    case ARP_DOWN:     return n - 1 - p;
+    case ARP_UPDOWN:   { int q = i % (2 * n - 2); return q < n ? q : 2 * n - 2 - q; }
+    case ARP_DOWNUP:   { int q = i % (2 * n - 2); return n - 1 - (q < n ? q : 2 * n - 2 - q); }
+    case ARP_RANDOM:   return clampi((int)(frand() * n), 0, n - 1);
+    case ARP_WALK:     *walk += frand() < 0.5f ? -1 : 1;
+                       if (*walk < 0) *walk = 1;
+                       if (*walk >= n) *walk = n - 2;
+                       return *walk;
+    case ARP_CONVERGE: return p % 2 == 0 ? p / 2 : n - 1 - p / 2;
+    case ARP_DIVERGE:  { int q = n - 1 - p; return q % 2 == 0 ? q / 2 : n - 1 - q / 2; }
+    default:           return p;   // UP, AS PLAYED
+    }
+}
+
+static void arp_process(Module *m)
+{
+    ArpSt *s = m->st;
+    float clk;
+    if (HAS(m, 4)) clk = IN(m, 4);
+    else {   // free-running eighths at 72 BPM
+        s->iph += 72.0f * 2.0f / 60.0f / SR;
+        if (s->iph >= 1) s->iph -= 1;
+        clk = s->iph < 0.5f;
+    }
+    if (rising(IN(m, 5), &s->prst)) { s->step = 0; s->cnt = 0; s->walk = 0; }
+    s->since++;
+    if (rising(clk, &s->pclk)) {
+        if (s->since > 16) s->period = s->since;
+        s->since = 0;
+        int div = clampi((int)roundf(m->p[2]), 1, 8);
+        if (s->cnt++ % div == 0) {
+            s->npool = arp_pool(m, s->pool);
+            int idx = arp_index((int)roundf(m->p[0]), s->step++, s->npool, &s->walk);
+            if (frand() < m->p[4]) {
+                s->note = s->pool[idx] + roundf(m->p[5]);
+                s->cur = idx;
+                s->gateLeft = (int)(s->period * div * m->p[3]);
+                s->gap = 48;   // a short low so every note retriggers
+            } else s->cur = -1;
+        }
+    }
+    m->out[0] = s->note;
+    m->out[1] = s->gap > 0 ? 0.0f : (s->gateLeft > 0 ? 1.0f : 0.0f);
+    if (s->gap > 0) s->gap--;
+    else if (s->gateLeft > 0) s->gateLeft--;
+}
+
+static void arp_draw(Module *m, Rectangle a)
+{
+    ArpSt *s = m->st;
+    DrawRectangleRec(a, INSET);
+    int mode = clampi((int)roundf(m->p[0]), 0, ARP_NMODES - 1);
+    txt(ARP_MODES[mode], a.x + 8, a.y + 6, 10, ACCENT);
+    const char *info = TextFormat("%d NOTES", s->npool);
+    txt(info, a.x + a.width - 8 - txt_w(info, 10), a.y + 6, 10, TEXT_DIM);
+    if (!s->npool) return;
+    float lo = s->pool[0], hi = s->pool[0];
+    for (int i = 1; i < s->npool; i++) { lo = fminf(lo, s->pool[i]); hi = fmaxf(hi, s->pool[i]); }
+    Rectangle r = { a.x + 8, a.y + 22, a.width - 16, a.height - 28 };
+    float bw = r.width / s->npool;
+    for (int i = 0; i < s->npool; i++) {
+        float t = hi > lo ? (s->pool[i] - lo) / (hi - lo) : 0.5f;
+        float h = 4 + t * (r.height - 4);
+        bool on = i == s->cur && s->gateLeft > 0;
+        DrawRectangleRec((Rectangle){ r.x + i * bw + 2, r.y + r.height - h, bw - 4, h }, on ? ACCENT : (i == s->cur ? ACCENT_DIM : (Color){ 60, 72, 68, 255 }));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PERFORMER — plays solo phrases in a scale and key. Phrases are written in
+// scale degrees, so each one works in every key and scale:
+//   3      degree 3 of the scale for one clock pulse (1 = root, 6 = root an
+//          octave up in a pentatonic scale, 8 in a seven-note mode)
+//   3--    the same note held for three pulses       .   a one-pulse rest
+//   ~3     slide up into the note                    3,  3'  octave down/up
+//   3b     blue note: a semitone up, only in the blues scales
+// ---------------------------------------------------------------------------
+
+enum { SC_AUTO, SC_MINP, SC_MAJP, SC_MINB, SC_MAJB, SC_ION, SC_DOR, SC_PHR, SC_LYD, SC_MIX, SC_AEO, SC_LOC, SC_COUNT };
+static const char *SCALE_LABELS[SC_COUNT] = {
+    "AUTO", "MIN PENTA", "MAJ PENTA", "MIN BLUES", "MAJ BLUES", "IONIAN", "DORIAN",
+    "PHRYGIAN", "LYDIAN", "MIXOLYDIAN", "AEOLIAN", "LOCRIAN" };
+static const struct { int n, st[7]; } SCALES[SC_COUNT] = {
+    [SC_MINP] = { 5, { 0, 3, 5, 7, 10 } },       [SC_MAJP] = { 5, { 0, 2, 4, 7, 9 } },
+    [SC_MINB] = { 5, { 0, 3, 5, 7, 10 } },       [SC_MAJB] = { 5, { 0, 2, 4, 7, 9 } },
+    [SC_ION]  = { 7, { 0, 2, 4, 5, 7, 9, 11 } }, [SC_DOR]  = { 7, { 0, 2, 3, 5, 7, 9, 10 } },
+    [SC_PHR]  = { 7, { 0, 1, 3, 5, 7, 8, 10 } }, [SC_LYD]  = { 7, { 0, 2, 4, 6, 7, 9, 11 } },
+    [SC_MIX]  = { 7, { 0, 2, 4, 5, 7, 9, 10 } }, [SC_AEO]  = { 7, { 0, 2, 3, 5, 7, 8, 10 } },
+    [SC_LOC]  = { 7, { 0, 1, 3, 5, 6, 8, 10 } },
+};
+
+static const char *PHRASES[] = {
+    // 1-32: minor pentatonic — calls, answers and sighs
+    "1--- 2- 3--- . 4----- . . .",          "4--- 3- 2- 1----- . . 5, 1---",
+    "6--- 5- 4--- . 3- 4------ . .",        "1- 2- 4--- . . 5- 4- 2------ .",
+    "4- 5- 6---- . 5- 4--- 2- 1----",       "~2--- 1- 5,----- . . 1------",
+    "3- 4- 5- 4- 2--- . . 1------",         "6-- 5- 6- 7---- . 6- 4------",
+    "1--- . 4--- . 5--- . 6-------",        "~4----- 3- 2- 3- 1------- .",
+    "2- 1- 5,- 1--- . . 2- 3- 4------",     "7--- 6- 5--- 4- 5------- . .",
+    "4- . 4- 5- 6--- 5- 4- 2-----",         "1-- 2-- 3-- 4------ . . 3- 2----",
+    "~6------- 5- 4- 5------- . .",         "4,- 5,- 1--- 2- 1- 5,------",
+    "3--- 2- 1--- . 2- 3- 4- 3-----",       "8--- 7- 6--- . 5- 6------- .",
+    "1- 4- 2- 5- 3- 6----- . . .",          "5- 4- 2- 1- 2- 4--- . 1------",
+    "~4--- . ~4--- . 5- 4- 2------",        "6- 4- 6- 7--- 6- 5- 4------",
+    "2--- 3--- 4--- 5--- 6-------",         "6--- 5--- 4--- 2--- 1-------",
+    "1- 2- 1- 5,--- . 4,- 5,- 1------",     "4-- 6-- 5-- 4-- 2-- 1------",
+    "~7----- 6- 4--- . 6--- 5------",       "3- 2- 3- 4---- . 2- 1- 2------",
+    "1------- . . 4------- . . 2-------",   "6- 7- 9----- . 8- 7- 6-------",
+    "4- 2- 4- 5- 4- 2- 1- 5,-------",       "2--- . 1- 2- 3--- . 2------ .",
+    // 33-64: major pentatonic — open, hopeful lines
+    "3--- 2- 1--- . 5,- 1-------",          "1- 2- 3- 4--- . 5- 4------ .",
+    "6--- 5- 4- 3--- . 2- 3-------",        "4- 5- 6- 7- 8----- . 7- 6-----",
+    "3-- 4-- 5-- 4----- . 3- 2- 1----",     "~3----- 2- 1- 2------- . .",
+    "5- 4- 3- 4- 5----- . 6-------",        "1--- 4--- 3--- 2- 1-------",
+    "8--- 6--- 7--- 5--- 6-------",         "2- 3- 5- 3- 2- 1--- . 5,------",
+    "4,- 5,- 1- 2- 3------ . 2- 1----",     "3- . 3- 4- 5--- 4- 3- 2------",
+    "6- 5- 4--- . 5- 4- 3--- . 1------",    "~5------- 4- 3- 4------- . .",
+    "1-- 3-- 4-- 6------ . 5- 4-----",      "7- 6- 5- 6--- . 4- 3- 4------",
+    "3--- . 5--- . 4- 3- 2- 3------",       "1- 2- 3- 2- 1- 5,- 4,------- .",
+    "4--- 6--- 8------- . 7- 6-----",       "2-- 1-- 5,-- 1------- . . .",
+    "5- 6- 5- 4- 3- 4--- . 3------",        "8- 7- 6- 5- 4--- . 5- 6-------",
+    "3- 4- 3- 2--- . 1- 2- 3-------",       "~4----- 5- 6----- . 5- 4------",
+    "1------ . 3------ . 4------- .",       "6- 4- 3- 1- 2--- 3- 4-------",
+    "4,- 1- 2- 3- 4- 5- 6------- .",        "7--- 8--- 9------- . 8- 7------",
+    "3- 2- 3- 5- 4--- . 3- 2- 1-----",      "5--- 3--- 4--- 2--- 3-------",
+    "1- 3- 2- 4- 3- 5- 4------- .",         "6------- 5- 4- 3------- . .",
+    // 65-96: minor blues — the blue note (b5) as a passing tone
+    "1- 2- 3- 3b- 4------ . 2- 1----",      "4- 3b- 3- 2--- . 1------- .",
+    "~2b- 2- 1--- . 5,- 1------",           "6- 5- 4- 3b- 3- 2- 1------",
+    "3- 3b- 4--- . 3- 3b- 4--- . 6-----",   "~4--- 3b- 3- 2- 1- 5,------",
+    "1- . 2- 2b- 3--- . 2- 1------",        "8b- 8- 7- 6--- . 5- 6-------",
+    "4--- 3b--- 3--- 2------- .",           "~6--- 5- 4- 3b- 4------- . .",
+    "2- 3- 3b- 3- 2- 1- 5,- 1-----",        "5- 6- 5- 4- 3b- 4------ . .",
+    "1--- ~2b- 3--- . 4- 3b- 3------",      "6- 4- 3b- 3- 4- 2- 1-------",
+    "~7--- 6- 5- 4--- . 3b- 4------",       "3- 3- 3b- 4- . 3- 2- 1------",
+    "1- 2- 3- 3b- 4- 5- 6------- .",        "6- 5- 4- 3b- 3- 2- 1- 5,------",
+    "~4------- 3b- 3- 2------- .",          "2- 1- 2- 2b- 3--- . 2- 1------",
+    "4- 6- 5- 4- 3b--- 3- 2------",         "8- 7- 6- 5- 6--- 4- 3b- 4------",
+    "1--- 3b--- 4--- 5- 6-------",          "~3b--- 4- 3b- 3- 2- 1-------",
+    "5- 4- 3b- 4- 5- 6--- . 5------",       "1- 5,- 1- 2- 2b- 3- 4-------",
+    "6--- . 6- 5- 4--- . 3b- 3- 2-----",    "4- 4- 3b- 3- 2- 3- 1-------",
+    "~6- 7- 8b- 8--- . 7- 6------",         "3--- 3b- 4- 3- 2- 1--- . 5,-----",
+    "2-- 3-- 3b-- 4------ . 2- 1----",      "~1- 2b- 3- 2- 1- 5,- 4,-------",
+    // 97-112: major blues — the minor third (2b) and flat seventh (5b)
+    "1- 2- 2b- 3--- . 5- 3- 1------",       "3- 2b- 2- 1--- . 5,- 1-------",
+    "5- 5b- 5- 4- 3--- . 2- 3------",       "~2b- 3--- 4- 3- 2- 1-------",
+    "6- 5b- 5- 4--- . 3- 2b- 3------",      "1--- 2b- 3- 4- 5- 4------- .",
+    "4- 3- 2b- 2- 1- 2- 3-------",          "~5b--- 5- 4- 3- 4------- .",
+    "3- 4- 5- 6- 5b- 5- 4------",           "2- 2b- 3- 1--- . 5,- 1------",
+    "8- 7b- 7- 6--- . 5- 6-------",         "1- 3- 2b- 3- 4--- . 3- 1------",
+    "~3------ 2b- 2- 1------- .",           "6--- 5b- 5- 3--- . 4- 3-----",
+    "4- 5- 5b- 5- 6- 8------- .",           "3- 2b- 1- 5,- 1- 2b- 3-------",
+    // 113-128: minor pentatonic — long tones and wide space
+    "1------- . . . . 4------- . . . .",    "4------- 2------- . . 1----------",
+    "6------- . . 5--- 4----------- . .",   "~2------- 1------- . . . 5,--------",
+    "3--- 4------- . . . 2-----------",     "5------ 4------ 2------ 1------",
+    "4----------- . . . . 6-----------",    "1--- . . . 2--- . . . 4----------",
+    "~4------- . . 3--- 2------- . .",      "7------- 6------- 4-----------",
+    "2----- 4----- 6------- . . . .",       "6--- 4--- 2--- 1-----------",
+    "~5--------- 4--- 2-------- . .",       "1------ 4,------ 5,------ 1-------",
+    "3-------- . . 4-------- . . 2--------", "6----------- . . . ~7--- 6-----------",
+    // 129-137: ionian
+    "3--- 2- 1--- . 5- 4- 3-------",        "1- 2- 3- 5--- . 6- 5------- .",
+    "5--- 4- 3- 2--- 1- 7,- 1------",       "8--- 7- 6- 5--- . 3- 4- 3------",
+    "1--- 3--- 5--- 7- 8-------",           "~4--- 3- 2- 3------- . 5----",
+    "6- 5- 4- 3- 2- 3--- . 1------",        "3- 4- 5- 7- 8----- . 7- 5-----",
+    "2------ . 3------ . 5--------",
+    // 138-148: dorian — the bright sixth in a minor mode
+    "1- 2- 3- 4- 5- 6--- . 5- 3------",     "6--- 5- 4- 3--- . 1- 3-------",
+    "~3--- 4- 5- 6------ . 5- 4----",       "8- 7- 6- 5--- 6- 4- 5-------",
+    "1--- 6,--- 7,- 1- 2- 3-------",        "5- 6- 8- 6- 5--- . 3- 4-------",
+    "4- 3- 1- 6,--- . 7,- 1-------",        "~6------- 5- 6- 7- 6------ .",
+    "3- 5- 6- 5- 3--- 2- 1-------",         "2--- 3--- 6------- . 5- 4-----",
+    "1- 3- 5- 6- 7- 6- 5------- .",
+    // 149-157: phrygian — the dark flat second
+    "1- 2--- 1--- . 7,- 1-------",          "~2------- 1- 7,- 1------- .",
+    "5- 6- 5- 4- 3- 2- 1-------",           "1--- 2--- 3--- 2- 1-------",
+    "8- 7- 6- 5--- . 6- 5------",           "3- 2- 3- 4--- . 2- 1------",
+    "5--- 6- 5- 2--- . 1-------",           "~8----- 9- 8- 7------ . .",
+    "1- 2- 1- 7,- 6,--- 7,- 1------",
+    // 158-168: lydian — the floating raised fourth
+    "3- 4- 5--- . 4- 3- 2------",           "1- 2- 3- 4------- . 3- 2- 1----",
+    "~4------- 5- 7- 8------- .",           "5--- 4- 3- 4--- . 7,- 1-------",
+    "8- 7- 5- 4--- . 5- 3-------",          "2- 3- 4- 6- 7- 8------- . .",
+    "4--- . 4- 5- 6- 5- 4------",           "1- 5- 4- 3- 2------- . 1----",
+    "~7------ 8- 9- 11------- .",           "3--- 4--- 5------- . 4- 2-----",
+    "6- 5- 4- 2- 3------- . . 1------",
+    // 169-177: mixolydian — major with a flat seventh
+    "5- 6- 7--- . 6- 5- 4- 3------",        "1- 3- 5- 7------- . 6- 5----",
+    "~7--- 8- 7- 5--- . 4- 3------",        "3- 4- 5- 6- 7- 6- 5------- .",
+    "8--- 7--- 5--- 4- 3-------",           "1--- 7,--- 1- 2- 3------ .",
+    "5- 7- 8- 9--- . 8- 7- 5-----",         "~3----- 4- 5- 7------- . .",
+    "2- 3- 1- 7,--- 6,- 7,- 1------",
+    // 178-186: aeolian — natural minor, the flat sixth
+    "1- 2- 3- 5--- . 6- 5------",           "~6--- 5- 4- 3--- 2- 1------",
+    "5--- 6--- 5- 3- 4-------",             "8- 7- 6- 5- 4- 3- 1-------",
+    "3--- . 2- 3- 4- 5- 6-------",          "1--- 5--- 6------- . 5- 3----",
+    "~3------- 2- 1- 7,------- .",          "6- 5- 6- 8--- . 7- 6- 5-----",
+    "4- 3- 2- 3- 1--- . 6,- 7,- 1-----",
+    // 187-192: locrian — the unsettled flat fifth
+    "1- 2- 3--- . 2- 1- 7,-------",         "5--- 4- 3- 2--- 1-------",
+    "~2----- 1- 7,- 6,------- .",           "3- 5- 6- 5- 3--- . 2- 1-----",
+    "8- 7- 5--- . 4- 3- 2------",           "1------ . 2------ . 5---------",
+};
+#define NPHRASE ((int)(sizeof PHRASES / sizeof PHRASES[0]))
+
+// The scale each block of phrases is written for (AUTO plays it there).
+static const struct { int end, scale; } PH_FAMILY[] = {
+    { 32, SC_MINP }, { 64, SC_MAJP }, { 96, SC_MINB }, { 112, SC_MAJB }, { 128, SC_MINP },
+    { 137, SC_ION }, { 148, SC_DOR }, { 157, SC_PHR }, { 168, SC_LYD }, { 177, SC_MIX },
+    { 186, SC_AEO }, { 192, SC_LOC },
+};
+
+static int phrase_scale(int ph)
+{
+    for (int i = 0; i < (int)(sizeof PH_FAMILY / sizeof PH_FAMILY[0]); i++)
+        if (ph < PH_FAMILY[i].end) return PH_FAMILY[i].scale;
+    return SC_MINP;
+}
+
+#define PH_MAX_EV 48
+
+typedef struct { signed char deg, oct; unsigned char len; bool rest, blue, slide; } PhEv;
+typedef struct { int n, units; PhEv ev[PH_MAX_EV]; } Phrase;
+static Phrase phrases[NPHRASE];
+
+static void parse_phrases(void)
+{
+    for (int p = 0; p < NPHRASE; p++) {
+        Phrase *ph = &phrases[p];
+        for (const char *s = PHRASES[p]; *s && ph->n < PH_MAX_EV; ) {
+            while (*s == ' ') s++;
+            if (!*s) break;
+            PhEv e = { 0 };
+            if (*s == '.') { e.rest = true; e.len = 1; s++; }
+            else {
+                if (*s == '~') { e.slide = true; s++; }
+                while (isdigit((unsigned char)*s)) e.deg = (signed char)(e.deg * 10 + (*s++ - '0'));
+                for (;; s++) {
+                    if (*s == ',') e.oct--;
+                    else if (*s == '\'') e.oct++;
+                    else if (*s == 'b') e.blue = true;
+                    else break;
+                }
+                e.len = 1;
+                while (*s == '-') { e.len++; s++; }
+                if (e.deg < 1) e.deg = 1;
+            }
+            ph->ev[ph->n++] = e;
+            ph->units += e.len;
+            while (*s && *s != ' ') s++;
+        }
+    }
+}
+
+static int scale_semi(int sc, int idx)
+{
+    int n = SCALES[sc].n;
+    int o = idx >= 0 ? idx / n : -((-idx + n - 1) / n);
+    return SCALES[sc].st[idx - o * n] + 12 * o;
+}
+
+static int scale_quantize(int sc, int semi)
+{
+    int pc = ((semi % 12) + 12) % 12, best = 0, bd = 99;
+    for (int k = 0; k < SCALES[sc].n; k++)
+        for (int w = -12; w <= 12; w += 12) {
+            int c = SCALES[sc].st[k] + w, d = abs(c - pc);
+            if (d < bd) { bd = d; best = c; }
+        }
+    return semi - pc + best;
+}
+
+// Semitones above the root for an event, in the selected scale.
+static int phrase_semi(int ph, int sel, const PhEv *e, int degOff)
+{
+    int home = phrase_scale(ph), sc = sel == SC_AUTO ? home : sel;
+    int semi = scale_semi(home, e->deg - 1 + degOff) + 12 * e->oct;
+    if (sc != home) semi = scale_quantize(sc, semi);
+    if (e->blue && (sc == SC_MINB || sc == SC_MAJB)) semi += 1;
+    return semi;
+}
+
+typedef struct {
+    int   ph, ev, units, cur;
+    bool  resting;
+    float pclk, prst, iph;
+    int   since, period, gateLeft, gap;
+    float target;
+    int   slideLeft, slideLen;
+} PerfSt;
+
+static void perf_init(Module *m)
+{
+    PerfSt *s = calloc(1, sizeof(PerfSt));
+    s->ph = -1; s->ev = -1; s->cur = -1;
+    s->period = (int)(SR * 0.4f);
+    m->st = s;
+}
+
+static int perf_root(Module *m)   // MIDI note of the key's root, F#3..F4
+{
+    int pc = HAS(m, 2) ? (((int)roundf(IN(m, 2) * 12)) % 12 + 12) % 12 : clampi((int)roundf(m->p[0]), 0, 11);
+    return pc <= 6 ? 60 + pc : 48 + pc;
+}
+
+static void perf_tick(Module *m)
+{
+    PerfSt *s = m->st;
+    int ph = clampi((int)roundf(m->p[2]), 0, NPHRASE - 1);
+    if (ph != s->ph) { s->ph = ph; s->ev = -1; s->units = 0; s->resting = false; }
+    if (s->units > 0 && --s->units > 0) return;
+    const Phrase *P = &phrases[ph];
+    if (s->resting) { s->resting = false; s->ev = -1; }
+    if (++s->ev >= P->n) {   // phrase done: breathe for SPACE pulses, then again
+        int space = (int)roundf(m->p[3]);
+        s->ev = -1; s->cur = -1;
+        if (space > 0) { s->resting = true; s->units = space; return; }
+        s->ev = 0;
+    }
+    const PhEv *e = &P->ev[s->ev];
+    s->units = e->len;
+    s->cur = s->ev;
+    if (e->rest) return;
+    int degOff = 0, octOff = 0;
+    float vary = m->p[4];
+    if (frand() < vary * 0.5f) {   // variation: leave a gap, step aside, or jump an octave
+        float r = frand();
+        if (r < 0.3f) { s->cur = -1; return; }
+        if (r < 0.7f) degOff = frand() < 0.5f ? -1 : 1;
+        else octOff = frand() < 0.5f ? -1 : 1;
+    }
+    int midi = perf_root(m) + phrase_semi(ph, clampi((int)roundf(m->p[1]), 0, SC_COUNT - 1), e, degOff) + 12 * octOff;
+    s->target = (midi - 60) / 12.0f + roundf(m->p[6]);
+    int len = s->period * e->len;
+    s->slideLen = s->slideLeft = e->slide ? (int)(len * 0.35f) : 0;
+    s->gateLeft = (int)(len * m->p[5]);
+    s->gap = 48;
+}
+
+static void perf_process(Module *m)
+{
+    PerfSt *s = m->st;
+    float clk;
+    if (HAS(m, 0)) clk = IN(m, 0);
+    else {   // free-running eighths at 72 BPM
+        s->iph += 72.0f * 2.0f / 60.0f / SR;
+        if (s->iph >= 1) s->iph -= 1;
+        clk = s->iph < 0.5f;
+    }
+    if (rising(IN(m, 1), &s->prst)) { s->ev = -1; s->units = 0; s->resting = false; }
+    s->since++;
+    if (rising(clk, &s->pclk)) {
+        if (s->since > 16) s->period = s->since;
+        s->since = 0;
+        perf_tick(m);
+    }
+    float p = s->target;
+    if (s->slideLeft > 0) { p -= (1.0f / 12.0f) * s->slideLeft / s->slideLen; s->slideLeft--; }
+    m->out[0] = p;
+    m->out[1] = s->gap > 0 ? 0.0f : (s->gateLeft > 0 ? 1.0f : 0.0f);
+    if (s->gap > 0) s->gap--;
+    else if (s->gateLeft > 0) s->gateLeft--;
+}
+
+static void perf_draw(Module *m, Rectangle a)
+{
+    PerfSt *s = m->st;
+    DrawRectangleRec(a, INSET);
+    int ph = clampi((int)roundf(m->p[2]), 0, NPHRASE - 1), sel = clampi((int)roundf(m->p[1]), 0, SC_COUNT - 1);
+    int sc = sel == SC_AUTO ? phrase_scale(ph) : sel;
+    int root = perf_root(m);
+    txt(TextFormat("PHRASE %03d  %s", ph + 1, SCALE_LABELS[phrase_scale(ph)]), a.x + 8, a.y + 6, 10, TEXT_DIM);
+    const char *key = TextFormat("%s %s", NOTE_NAMES[root % 12], SCALE_LABELS[sc]);
+    txt(key, a.x + a.width - 8 - txt_w(key, 10), a.y + 6, 10, ACCENT);
+
+    // the phrase as a small piano roll
+    const Phrase *P = &phrases[ph];
+    int lo = 99, hi = -99;
+    for (int i = 0; i < P->n; i++)
+        if (!P->ev[i].rest) { int v = phrase_semi(ph, sel, &P->ev[i], 0); lo = v < lo ? v : lo; hi = v > hi ? v : hi; }
+    if (lo > hi) return;
+    Rectangle r = { a.x + 8, a.y + 22, a.width - 16, a.height - 28 };
+    float uw = r.width / (P->units ? P->units : 1), x = r.x;
+    for (int i = 0; i < P->n; i++) {
+        const PhEv *e = &P->ev[i];
+        float w = e->len * uw;
+        if (!e->rest) {
+            int v = phrase_semi(ph, sel, e, 0);
+            float t = hi > lo ? (float)(v - lo) / (hi - lo) : 0.5f;
+            float y = r.y + (1 - t) * (r.height - 4);
+            bool on = i == s->cur && s->ph == ph;
+            Color c = on ? ACCENT : (e->blue && (sc == SC_MINB || sc == SC_MAJB) ? fade(CABLE_COLORS[0], 0.8f) : (Color){ 70, 96, 86, 255 });
+            DrawRectangleRec((Rectangle){ x + 1, y, fmaxf(w - 2, 2), 4 }, c);
+        }
+        x += w;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Module registry
 // ---------------------------------------------------------------------------
 
@@ -1113,12 +1563,24 @@ static const ModDef DEFS[M_COUNT] = {
           { "FEEDBACK", 0, 1, 0.6f, K_KNOB, F_PCT },        { "WOW", 0, 1, 0.3f, K_KNOB, F_PCT },
           { "MIX", 0, 1, 0.5f, K_KNOB, F_PCT },             { "LEVEL", 0, 1, 0.8f, K_KNOB, F_PCT } },
         tape_init, tape_process, tape_draw, tape_press, tape_drag, tape_save, tape_load_data, tape_fini },
+    [M_ARP] = { "ARPEGGIATOR", 412, 56, 6, 2, 6, { "N1", "N2", "N3", "N4", "CLOCK", "RESET" }, { "NOTE", "GATE" },
+        { { "MODE", 0, ARP_NMODES - 1, ARP_UPDOWN, K_STEP, F_LABEL, ARP_MODES }, { "OCTAVES", 1, 4, 2, K_STEP, F_INT },
+          { "DIVIDE", 1, 8, 1, K_STEP, F_INT },   { "GATE", 0.05f, 1, 0.5f, K_KNOB, F_PCT },
+          { "CHANCE", 0, 1, 0.9f, K_KNOB, F_PCT }, { "OCTAVE", -2, 2, 0, K_STEP, F_OCT } },
+        arp_init, arp_process, arp_draw, NULL, NULL },
+    [M_PERF] = { "PERFORMER", 476, 74, 3, 2, 7, { "CLOCK", "RESET", "ROOT" }, { "NOTE", "GATE" },
+        { { "KEY", 0, 11, 9, K_STEP, F_LABEL, NOTE_NAMES }, { "SCALE", 0, SC_COUNT - 1, SC_AUTO, K_STEP, F_LABEL, SCALE_LABELS },
+          { "PHRASE", 0, NPHRASE - 1, 0, K_STEP, F_PROG },  { "SPACE", 0, 32, 8, K_STEP, F_INT },
+          { "VARY", 0, 1, 0.2f, K_KNOB, F_PCT },             { "GATE", 0.1f, 1, 0.85f, K_KNOB, F_PCT },
+          { "OCTAVE", -2, 2, 0, K_STEP, F_OCT } },
+        perf_init, perf_process, perf_draw, NULL, NULL },
 };
 
 // Stable ids used in preset files.
 static const char *MOD_ID[M_COUNT] = {
     [M_CLOCK] = "clock", [M_SEQ] = "seq", [M_CHORD] = "chords", [M_OSC3] = "osc3",
     [M_LFO] = "lfo", [M_REVERB] = "reverb", [M_OUT] = "output", [M_TAPE] = "tape",
+    [M_ARP] = "arp", [M_PERF] = "performer",
 };
 
 // ---------------------------------------------------------------------------
@@ -1250,6 +1712,7 @@ static const char *knob_text(const KnobDef *k, float v)
     case F_OCT:  return TextFormat("%+d OCT", (int)roundf(v));
     case F_PCT:  return TextFormat("%.0f%%", knob_to_t(k, v) * 100);
     case F_PROG: return TextFormat("#%02d", (int)roundf(v) + 1);
+    case F_LABEL: return k->labels[clampi((int)roundf(v - k->min), 0, (int)(k->max - k->min))];
     default:     return TextFormat("%.2f", v);
     }
 }
@@ -1753,6 +2216,33 @@ static const struct { const char *name, *body; } FACTORY[] = {
       "cable 0 1 1 0 3\ncable 1 0 2 3 1\ncable 1 1 2 4 2\n"
       "cable 2 0 3 0 4\ncable 2 1 3 1 4\ncable 3 0 4 0 0\ncable 3 1 4 1 0\n"
       "cable 4 0 5 0 2\ncable 4 1 5 1 2\n" },
+    { "chord arpeggio",
+      "module clock 0 0\nknob BPM 66\n"
+      "module chords 256 0\n"
+      "module arp 652 0\nknob MODE 2\nknob OCTAVES 2\nknob DIVIDE 2\nknob GATE 0.6\nknob CHANCE 0.85\n"
+      "module osc3 0 300\nknob WAVE 0.3\nknob CUTOFF 700\nknob ATTACK 3\nknob LEVEL 0.45\n"
+      "module osc3 436 300\nknob WAVE 0.1\nknob DETUNE 0.15\nknob CUTOFF 2200\n"
+      "knob ATTACK 0.02\nknob RELEASE 1.8\nknob GLIDE 0.02\nknob LEVEL 0.4\n"
+      "module reverb 872 300\nknob SIZE 1.6\nknob DECAY 18\nknob MIX 0.55\n"
+      "module output 1132 300\n"
+      "cable 0 2 1 0 0\ncable 0 0 2 4 3\n"
+      "cable 1 0 2 0 1\ncable 1 1 2 1 1\ncable 1 2 2 2 1\ncable 1 3 2 3 1\n"
+      "cable 1 0 3 0 1\ncable 1 1 3 1 1\ncable 1 2 3 2 1\n"
+      "cable 2 0 4 0 2\ncable 2 0 4 1 2\ncable 2 0 4 2 2\ncable 2 1 4 3 3\n"
+      "cable 3 0 5 0 4\ncable 3 1 5 1 4\ncable 4 0 5 0 4\ncable 4 1 5 1 4\n"
+      "cable 5 0 6 0 0\ncable 5 1 6 1 0\n" },
+    { "pentatonic performer",
+      "module clock 0 0\nknob BPM 60\n"
+      "module performer 256 0\nknob KEY 0\nknob PHRASE 0\nknob SPACE 8\nknob VARY 0.25\n"
+      "module osc3 756 0\nknob OCTAVE -1\nknob WAVE 0.3\nknob CUTOFF 450\nknob ATTACK 6\nknob LEVEL 0.35\n"
+      "module osc3 0 300\nknob WAVE 0.25\nknob DETUNE 0.2\nknob CUTOFF 1800\nknob ATTACK 0.08\n"
+      "knob RELEASE 2.5\nknob GLIDE 0.12\nknob MOD_AMT 0.3\nknob LEVEL 0.5\n"
+      "module tape 436 300\nknob TIME 2.5\nknob FEEDBACK 0.55\nknob WOW 0.4\nknob MIX 0.4\ndata 1 1\n"
+      "module reverb 872 300\nknob SIZE 1.6\nknob DECAY 20\nknob MIX 0.55\n"
+      "module output 1132 300\n"
+      "cable 0 0 1 0 3\ncable 1 0 3 0 2\ncable 1 0 3 1 2\ncable 1 0 3 2 2\ncable 1 1 3 3 3\n"
+      "cable 3 0 4 0 4\ncable 3 1 4 1 4\ncable 4 0 5 0 0\ncable 4 1 5 1 0\n"
+      "cable 2 0 5 0 1\ncable 2 1 5 1 1\ncable 5 0 6 0 0\ncable 5 1 6 1 0\n" },
 };
 #define N_FACTORY ((int)(sizeof FACTORY / sizeof FACTORY[0]))
 
@@ -1966,7 +2456,7 @@ static struct {
     double  toastT;
 } ui = { .lastKnobMod = -1, .toastT = -10 };
 
-static const int MENU_ORDER[M_COUNT] = { M_CLOCK, M_LFO, M_SEQ, M_CHORD, M_OSC3, M_TAPE, M_REVERB, M_OUT };
+static const int MENU_ORDER[M_COUNT] = { M_CLOCK, M_LFO, M_SEQ, M_CHORD, M_ARP, M_PERF, M_OSC3, M_TAPE, M_REVERB, M_OUT };
 #define MENU_W 160
 #define MENU_ITEM_H 24
 #define MENU_N (M_COUNT + 1)   // modules + "PRESET RACK..."
@@ -2598,6 +3088,7 @@ static void default_layout(void)
 int main(void)
 {
     parse_progressions();
+    parse_phrases();
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(1280, 760, "raya");
