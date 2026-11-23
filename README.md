@@ -9,6 +9,12 @@ raya is a modular synth environment implemented in **C99** using **raylib**.
 Compiled to WebAssembly, it runs as a web app. At the same time it can run
 natively, and the door stays open to turn it into a VST plugin.
 
+Here is a little demo showing the modular nature and live-changing of dials / stepping of the sequencer:
+
+<video src='https://github.com/user-attachments/assets/dedc22cf-9c75-4ca2-8f60-277346a54e30' width=180 />
+
+
+
 ## Philosophy
 
 - **Minimalist.** Everything lives in a single file: `raya.c`.
