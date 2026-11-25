@@ -38,6 +38,7 @@ https://github.com/user-attachments/assets/dedc22cf-9c75-4ca2-8f60-277346a54e30
 | ARPEGGIATOR | Arpeggiates the chord tones patched into N1–N4 (e.g. from CHORDS) over 1–4 octaves: up, down, up-down, down-up, random, walk, converge, diverge or as played. Divide, gate length and chance per step. Plays A minor 7 when nothing is patched. |
 | PERFORMER | Plays solo phrases in any of the 12 keys (see below). |
 | 3X OSC | Three detuned oscillator pairs (sine → triangle → saw), filter, swell envelope, stereo. Pitches from P1–P3, swells on GATE, a drone when GATE is unpatched. |
+| WAVOR | Wavetable / additive / sampling synth: 64 waves or your own, 64 morphers, up to 64 unison voices shaped across the stereo image, and a 10-effect chain (see below). |
 | LFO | Slow sine, triangle, smooth drift and sample-and-hold for modulation. |
 | DRUMS | 16 drum kits with 16 pads each, every pad with its own trigger input (see below). |
 | SAMPLER | Plays regions of an audio file between up to 8 markers (see below). |
@@ -93,6 +94,56 @@ The factory preset *electro 128* is a rough reproduction of a 128 BPM electro-ho
 - **Structure:** 11 sections over 232 bars, mapped from an analysis of the track: intro, beat, drop-out, breakdown, drop, hat wash, deep groove, an electro-break return and the outro.
 - **Drums and bass:** the PUNCHY kit (kick, clap, hats and shaker), plus a rolling bass built from the chord root and a sequencer.
 - **Synths:** a chorused pad whose FILTER opens with the arranger's LEVEL, and an arpeggiated lead with a dotted-8th tape echo.
+
+## Wavor
+
+WAVOR is a wavetable, additive and sampling synth in one module. The left pane is the voice; the right pane is its effect chain.
+
+- **Envelope:** ADSR on GATE. With GATE unpatched it holds, so WAVOR drones. P1–P4 take up to four pitches (P1 plays C3 when unpatched), for example the four notes from CHORDS.
+- **Master:** OCTAVE, GLIDE, PHASE RND (0 starts every voice in phase for a unison swoosh, 1 at random), LEVEL. The second row moves the wavetable POSITION: the knob, ENV>POS, and a slow internal LFO (LFO RATE, LFO>POS). The POS input adds to it.
+- **Wavetable:** click the wave name to pick one of 64 waves (sine, triangle, square, 8-bit, saws, pulses, organs, flute, clarinet, brass, strings, five vowels, choir, bells, FM, sync, formant, random, noise and more), or use the mouse wheel on it to step through them.
+  - **DRAW** copies the wave on screen into an editor. In **SHAPE** you draw one cycle; in **PARTIALS** you set the levels of harmonics 1–32 (additive).
+  - **Sampling:** drop an audio file onto WAVOR and it finds the pitch where the file is loudest and takes exactly one cycle of it as the shape.
+- **Morphers:** four slots, each with one of 64 morphers and an AMOUNT. Click a slot to choose from an 8 × 8 grid, or use the mouse wheel; right-click bypasses it. The families:
+
+  | Family | Morphers |
+  | --- | --- |
+  | Warp | skew left/right, pinch, bend, mirror, squash (PWM), stretch, flip |
+  | Frequency | sync, soft sync, multiply, shift partials up/down, spread, squeeze, add octave |
+  | FM + mod | FM at 1x/2x/3x/7x, self FM, ring, AM, dispersion |
+  | Shape | saturate, hard clip, fold, asymmetric, rectify, fatten, expand, wrap |
+  | Digital | bitcrush, downsample, Chebyshev 2/3, slew, noise, random partials, stutter |
+  | Filter | low-, high-, band-pass, sweeping formant, comb, notch, darken, brighten |
+  | Harmonics | odd only, even only, decimate, primes, octaves, blur, peaks, invert |
+  | Texture | vowel sweep, window, resonate, sine shaper, scramble phases, spectral gate, to sine, to saw |
+
+  The view shows the whole table as 32 frames, from the plain wave at the front to fully morphed at the back. POSITION picks the frame (bright green), so modulating it sweeps through the morph.
+- **Voices:** VOICES makes up to 64 copies of everything above. The stage shows the listener at the bottom and a bar for every voice where it sits in the stereo image. SPREAD sets how wide they spread. Five curves change the voices across the stereo image:
+  - **Detune:** how far each voice is detuned, up to ±50 cents.
+  - **Aggression:** fades the voice towards a brighter, saturated copy of the table, so it gets more high-frequency content.
+  - **Entropizer:** randomizes each voice's pitch, place, brightness, level and position. The offsets keep wandering at ENT RATE.
+  - **Position:** offsets each voice's wavetable position, so the left and right sides can play different frames.
+  - **Level:** the volume of each voice.
+
+  Pick a curve with its tab, then drag in the stage: the left, centre and right handles shape it. Right-click resets the curve.
+- **FX chain:** ten effects in series. Click an effect's name to switch it on or off.
+
+  | Effect | Controls |
+  | --- | --- |
+  | FILTER | LP/BP/HP/notch, cutoff (follows the envelope and the CUTOFF input), resonance |
+  | EQ | low shelf, mid bell with its frequency, high shelf |
+  | SATURATION | warm tanh drive, bias for even harmonics, tone, mix |
+  | DISTORTION | clip, fold, bit/rate crush or fuzz; drive, tone, mix |
+  | COMPRESSOR | threshold, ratio, attack, release, makeup, with a gain-reduction meter |
+  | CHORUS | rate, depth, mix |
+  | FLANGER | rate, depth, feedback, mix |
+  | PHASER | six allpass stages: rate, depth, feedback, mix |
+  | DELAY | time up to 2.5 s, feedback, ping-pong, tone, mix |
+  | PLATE REVERB | a Dattorro plate: predelay, decay, damping, mix |
+
+- **How it works:** the wave and the morphers are rendered into 32 frames and band-limited by FFT into mip levels, a few frames per video frame. Changing a morpher rebuilds the table in the background, and playing only reads it, so 64 voices stay cheap.
+
+The factory presets *wavor chords* and *wavor glass arp* show it in a patch.
 
 ## Drums
 

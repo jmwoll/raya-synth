@@ -25,6 +25,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include "layer3.h"   // shine MP3 encoder
@@ -108,7 +109,7 @@ static const char *NOTE_NAMES[12] = { "C","C#","D","D#","E","F","F#","G","G#","A
 // ---------------------------------------------------------------------------
 
 enum { K_KNOB, K_EXP, K_STEP, K_SEG };
-enum { F_NUM, F_INT, F_HZ, F_SEC, F_BPM, F_SEMI, F_PCT, F_PROG, F_OCT, F_LABEL };
+enum { F_NUM, F_INT, F_HZ, F_SEC, F_BPM, F_SEMI, F_PCT, F_PROG, F_OCT, F_LABEL, F_DB, F_RATIO };
 
 typedef struct {
     const char  *name;
@@ -178,7 +179,7 @@ enum { SAVE_LATER, SAVE_NOW, SAVE_ALL };   // how urgently a module stores its a
 static volatile int g_route;  // routing copy the audio thread should use
 static int    g_cur;          // routing copy used during the current audio block
 
-enum { M_CLOCK, M_SEQ, M_CHORD, M_OSC3, M_LFO, M_REVERB, M_OUT, M_TAPE, M_ARP, M_PERF, M_DRUMS, M_SAMPLER, M_FILTER, M_CHORUS, M_ARR, M_COUNT };
+enum { M_CLOCK, M_SEQ, M_CHORD, M_OSC3, M_LFO, M_REVERB, M_OUT, M_TAPE, M_ARP, M_PERF, M_DRUMS, M_SAMPLER, M_FILTER, M_CHORUS, M_ARR, M_WAVOR, M_COUNT };
 static const ModDef DEFS[M_COUNT];
 
 static float IN(Module *m, int i)
@@ -3029,6 +3030,1755 @@ static void arr_load(Module *m, const char *str)
 }
 
 // ---------------------------------------------------------------------------
+// WAVOR — wavetable / additive / sampling hybrid synth.
+//
+// Left pane: an ADSR, the WAVETABLE (one of 64 waves, a drawn shape, drawn
+// partials, or one cycle sampled from a dropped audio file), four MORPHERS
+// (64 kinds) that reshape it, and the VOICES stage: up to 64 unison copies
+// of all of that, spread across the stereo image and shaped by curves
+// (detune, aggressiveness, entropizer, position, level). Right pane: a chain
+// of ten effects.
+//
+// The UI turns wave + morphers into WV_F frames (frame 0 = the plain wave,
+// the last = fully morphed; POSITION picks between them) and band-limits each
+// frame into mip levels by FFT, a few frames per video frame. Every frame
+// also gets a brighter, saturated twin that AGGRESSIVENESS fades towards. The
+// audio side only reads finished tables, handed over like the tape buffers.
+// ---------------------------------------------------------------------------
+
+#define WV_N      2048                 // samples per cycle at full resolution
+#define WV_HALF   (WV_N / 2)
+#define WV_F      32                   // frames from plain wave to fully morphed
+#define WV_LV     9                    // mip levels: 512, 256, ... 2 harmonics
+#define WV_T      4233                 // floats per frame and variant: all levels plus a guard sample each
+#define WV_MAXV   64                   // unison voices per note
+#define WV_NOTES  4
+#define WV_SLOTS  4
+#define WV_NWAVE  64
+#define WV_USER   WV_NWAVE             // wave index of the user table
+#define WV_UPTS   256                  // points of a drawn shape
+#define WV_HARM   32                   // partials in the additive editor
+#define WV_BLOCK  32                   // the engine renders in blocks (one block of latency)
+#define WV_NCURVE 5
+#define WV_DISP   96                   // points per frame in the wavetable view
+#define WV_DLY    131072               // delay line: 2.7 s
+#define WV_CHO    4096
+#define WV_FLG    2048
+#define WV_W      1220                 // module width
+#define WV_H      704                  // custom area height
+
+static float knob_to_t(const KnobDef *k, float v);
+static float knob_from_t(const KnobDef *k, float t);
+static const char *knob_text(const KnobDef *k, float v);
+
+static float wv_cs[WV_HALF], wv_sn[WV_HALF];
+static int   wv_lsize[WV_LV], wv_loff[WV_LV];
+static float wv_thumb[WV_NWAVE][48];
+static bool  wv_inited;
+
+static const char *WV_WAVES[WV_NWAVE + 1] = {
+    "SINE", "TRIANGLE", "SQUARE", "8-BIT", "SAW", "PULSE 25", "PULSE 12", "HALF SINE",
+    "ABS SINE", "SOFT SAW", "SOFT SQR", "TRAPEZOID", "STAIRS", "NES TRI", "PARABOLA", "DBL SAW",
+    "SINE+OCT", "SINE+12", "ORGAN 1", "ORGAN 2", "ORGAN 3", "FLUTE", "CLARINET", "OBOE",
+    "BRASS", "STRINGS", "VOCAL A", "VOCAL E", "VOCAL I", "VOCAL O", "VOCAL U", "CHOIR",
+    "BELL", "GLASS", "HOLLOW", "NASAL", "PRIMES", "FIBONACCI", "OCTAVES", "ODD HARM",
+    "EVEN HARM", "BUZZ 16", "BUZZ 64", "FORMANT 1", "FORMANT 2", "FORMANT 3", "RANDOM 1", "RANDOM 2",
+    "NOISE", "RESO SAW", "RESO PLS", "PHASE DST", "FM 1:1", "FM 2:1", "FM 3:1", "FM BELL",
+    "SYNC SAW", "SYNC SINE", "FOLDED", "CHEBYSHEV", "TANH SAW", "SPIKE", "BIPULSE", "SAW+SQR",
+    "USER",
+};
+
+// 64 morphers in 8 families of 8 (the picker shows one family per column).
+static const char *WV_MCAT[8] = { "WARP", "FREQUENCY", "FM + MOD", "SHAPE", "DIGITAL", "FILTER", "HARMONICS", "TEXTURE" };
+static const char *WV_MORPHS[64] = {
+    "SKEW L", "SKEW R", "PINCH", "BEND", "MIRROR", "SQUASH", "STRETCH", "FLIP",
+    "SYNC", "SOFT SYNC", "MULTIPLY", "SHIFT UP", "SHIFT DN", "SPREAD", "SQUEEZE", "+OCTAVE",
+    "FM 1X", "FM 2X", "FM 3X", "FM 7X", "SELF FM", "RING 3X", "AM", "DISPERSE",
+    "SATURATE", "HARDCLIP", "FOLD", "ASYM", "RECTIFY", "FATTEN", "EXPAND", "WRAP",
+    "BITCRUSH", "DOWNSMPL", "CHEBY 2", "CHEBY 3", "SLEW", "NOISE", "RND HARM", "STUTTER",
+    "LOWPASS", "HIGHPASS", "BANDPASS", "FORMANT", "COMB", "NOTCH", "DARKEN", "BRIGHTEN",
+    "ODD ONLY", "EVEN ONLY", "DECIMATE", "PRIMES", "OCTAVES", "BLUR", "PEAKS", "INVERT",
+    "VOWEL", "WINDOW", "RESONATE", "SINE SHP", "SCRAMBLE", "SPEC GATE", "TO SINE", "TO SAW",
+};
+
+// ---- parameters -----------------------------------------------------------
+
+enum { WC_DET, WC_AGG, WC_ENT, WC_POS, WC_LVL };
+static const char *WV_CURVES[WV_NCURVE] = { "DETUNE", "AGGRESSION", "ENTROPIZER", "POSITION", "LEVEL" };
+static const int   WV_CURVE_COL[WV_NCURVE] = { 0, 1, 4, 3, 2 };   // CABLE_COLORS
+
+enum {
+    WQ_A, WQ_D, WQ_S, WQ_R,
+    WQ_OCT, WQ_GLIDE, WQ_PHASE, WQ_LEVEL, WQ_POS, WQ_ENVPOS, WQ_LFORATE, WQ_LFOPOS,
+    WQ_WAVE,
+    WQ_M1T, WQ_M1A, WQ_M2T, WQ_M2A, WQ_M3T, WQ_M3A, WQ_M4T, WQ_M4A,
+    WQ_VOICES, WQ_SPREAD, WQ_ENTRATE,
+    WQ_CURVE,                                   // WV_NCURVE x (left, centre, right)
+    WQ_FLT_ON = WQ_CURVE + WV_NCURVE * 3, WQ_FLT_MODE, WQ_FLT_CUT, WQ_FLT_RES, WQ_FLT_ENV,
+    WQ_EQ_ON, WQ_EQ_LOW, WQ_EQ_MID, WQ_EQ_FREQ, WQ_EQ_HIGH,
+    WQ_SAT_ON, WQ_SAT_DRIVE, WQ_SAT_BIAS, WQ_SAT_TONE, WQ_SAT_MIX,
+    WQ_DST_ON, WQ_DST_TYPE, WQ_DST_DRIVE, WQ_DST_TONE, WQ_DST_MIX,
+    WQ_CMP_ON, WQ_CMP_THR, WQ_CMP_RATIO, WQ_CMP_ATK, WQ_CMP_REL, WQ_CMP_GAIN,
+    WQ_CHO_ON, WQ_CHO_RATE, WQ_CHO_DEPTH, WQ_CHO_MIX,
+    WQ_FLG_ON, WQ_FLG_RATE, WQ_FLG_DEPTH, WQ_FLG_FB, WQ_FLG_MIX,
+    WQ_PHS_ON, WQ_PHS_RATE, WQ_PHS_DEPTH, WQ_PHS_FB, WQ_PHS_MIX,
+    WQ_DLY_ON, WQ_DLY_TIME, WQ_DLY_FB, WQ_DLY_PING, WQ_DLY_TONE, WQ_DLY_MIX,
+    WQ_PLT_ON, WQ_PLT_PRE, WQ_PLT_DECAY, WQ_PLT_DAMP, WQ_PLT_MIX,
+    WQ_N
+};
+
+typedef struct { const char *key; KnobDef k; } WvParam;
+
+static const char *WV_FLT_MODES[] = { "LP", "BP", "HP", "NOTCH" };
+static const char *WV_DST_TYPES[] = { "CLIP", "FOLD", "CRUSH", "FUZZ" };
+
+#define WV_ONOFF(key, name, on) { key, { name, 0, 1, on, K_STEP, F_INT } }
+#define WV_CURVE_P(c, key, l, m, r) \
+    [WQ_CURVE + (c) * 3]     = { key "l", { "LEFT",   0, 1, l, K_KNOB, F_PCT } }, \
+    [WQ_CURVE + (c) * 3 + 1] = { key "c", { "CENTRE", 0, 1, m, K_KNOB, F_PCT } }, \
+    [WQ_CURVE + (c) * 3 + 2] = { key "r", { "RIGHT",  0, 1, r, K_KNOB, F_PCT } }
+
+static const WvParam WVP[WQ_N] = {
+    [WQ_A]       = { "a",       { "ATTACK", 0.002f, 20, 1.2f, K_EXP, F_SEC } },
+    [WQ_D]       = { "d",       { "DECAY", 0.01f, 20, 2.5f, K_EXP, F_SEC } },
+    [WQ_S]       = { "s",       { "SUSTAIN", 0, 1, 0.75f, K_KNOB, F_PCT } },
+    [WQ_R]       = { "r",       { "RELEASE", 0.01f, 30, 5, K_EXP, F_SEC } },
+    [WQ_OCT]     = { "oct",     { "OCTAVE", -3, 3, 0, K_STEP, F_OCT } },
+    [WQ_GLIDE]   = { "glide",   { "GLIDE", 0, 2, 0.35f, K_KNOB, F_SEC } },
+    [WQ_PHASE]   = { "phase",   { "PHASE RND", 0, 1, 1, K_KNOB, F_PCT } },
+    [WQ_LEVEL]   = { "level",   { "LEVEL", 0, 1, 0.7f, K_KNOB, F_PCT } },
+    [WQ_POS]     = { "pos",     { "POSITION", 0, 1, 0.3f, K_KNOB, F_PCT } },
+    [WQ_ENVPOS]  = { "envpos",  { "ENV>POS", -1, 1, 0.15f, K_KNOB, F_NUM } },
+    [WQ_LFORATE] = { "lforate", { "LFO RATE", 0.01f, 8, 0.07f, K_EXP, F_HZ } },
+    [WQ_LFOPOS]  = { "lfopos",  { "LFO>POS", 0, 1, 0.25f, K_KNOB, F_PCT } },
+    [WQ_WAVE]    = { "wave",    { "WAVE", 0, WV_USER, 25, K_STEP, F_INT } },
+    [WQ_M1T]     = { "m1",      { "MORPH 1", 0, 63, 43, K_STEP, F_INT } },
+    [WQ_M1A]     = { "m1a",     { "AMOUNT", 0, 1, 0.7f, K_KNOB, F_PCT } },
+    [WQ_M2T]     = { "m2",      { "MORPH 2", 0, 63, 9, K_STEP, F_INT } },
+    [WQ_M2A]     = { "m2a",     { "AMOUNT", 0, 1, 0.45f, K_KNOB, F_PCT } },
+    [WQ_M3T]     = { "m3",      { "MORPH 3", 0, 63, 46, K_STEP, F_INT } },
+    [WQ_M3A]     = { "m3a",     { "AMOUNT", 0, 1, 0, K_KNOB, F_PCT } },
+    [WQ_M4T]     = { "m4",      { "MORPH 4", 0, 63, 24, K_STEP, F_INT } },
+    [WQ_M4A]     = { "m4a",     { "AMOUNT", 0, 1, 0, K_KNOB, F_PCT } },
+    [WQ_VOICES]  = { "voices",  { "VOICES", 1, WV_MAXV, 8, K_STEP, F_INT } },
+    [WQ_SPREAD]  = { "spread",  { "SPREAD", 0, 1, 0.85f, K_KNOB, F_PCT } },
+    [WQ_ENTRATE] = { "entrate", { "ENT RATE", 0.01f, 4, 0.15f, K_EXP, F_HZ } },
+    WV_CURVE_P(WC_DET, "cdet", 0.55f, 0.2f, 0.55f),
+    WV_CURVE_P(WC_AGG, "cagg", 0.15f, 0, 0.15f),
+    WV_CURVE_P(WC_ENT, "cent", 0.35f, 0.25f, 0.35f),
+    WV_CURVE_P(WC_POS, "cpos", 0.38f, 0.5f, 0.62f),
+    WV_CURVE_P(WC_LVL, "clvl", 0.8f, 1, 0.8f),
+    [WQ_FLT_ON]    = WV_ONOFF("flt", "FILTER", 1),
+    [WQ_FLT_MODE]  = { "fltmode", { "MODE", 0, 3, 0, K_STEP, F_LABEL, WV_FLT_MODES } },
+    [WQ_FLT_CUT]   = { "fltcut",  { "CUTOFF", 30, 18000, 5000, K_EXP, F_HZ } },
+    [WQ_FLT_RES]   = { "fltres",  { "RESO", 0, 1, 0.15f, K_KNOB, F_PCT } },
+    [WQ_FLT_ENV]   = { "fltenv",  { "ENV AMT", -1, 1, 0.2f, K_KNOB, F_NUM } },
+    [WQ_EQ_ON]     = WV_ONOFF("eq", "EQ", 0),
+    [WQ_EQ_LOW]    = { "eqlow",   { "LOW", -15, 15, 0, K_KNOB, F_DB } },
+    [WQ_EQ_MID]    = { "eqmid",   { "MID", -15, 15, 0, K_KNOB, F_DB } },
+    [WQ_EQ_FREQ]   = { "eqfreq",  { "MID FREQ", 150, 8000, 1000, K_EXP, F_HZ } },
+    [WQ_EQ_HIGH]   = { "eqhigh",  { "HIGH", -15, 15, 0, K_KNOB, F_DB } },
+    [WQ_SAT_ON]    = WV_ONOFF("sat", "SATURATION", 0),
+    [WQ_SAT_DRIVE] = { "satdrive", { "DRIVE", 0, 1, 0.35f, K_KNOB, F_PCT } },
+    [WQ_SAT_BIAS]  = { "satbias",  { "BIAS", 0, 1, 0.2f, K_KNOB, F_PCT } },
+    [WQ_SAT_TONE]  = { "sattone",  { "TONE", 0, 1, 0.7f, K_KNOB, F_PCT } },
+    [WQ_SAT_MIX]   = { "satmix",   { "MIX", 0, 1, 1, K_KNOB, F_PCT } },
+    [WQ_DST_ON]    = WV_ONOFF("dst", "DISTORTION", 0),
+    [WQ_DST_TYPE]  = { "dsttype",  { "TYPE", 0, 3, 0, K_STEP, F_LABEL, WV_DST_TYPES } },
+    [WQ_DST_DRIVE] = { "dstdrive", { "DRIVE", 0, 1, 0.4f, K_KNOB, F_PCT } },
+    [WQ_DST_TONE]  = { "dsttone",  { "TONE", 0, 1, 0.6f, K_KNOB, F_PCT } },
+    [WQ_DST_MIX]   = { "dstmix",   { "MIX", 0, 1, 0.5f, K_KNOB, F_PCT } },
+    [WQ_CMP_ON]    = WV_ONOFF("cmp", "COMPRESSOR", 0),
+    [WQ_CMP_THR]   = { "cmpthr",   { "THRESH", -40, 0, -18, K_KNOB, F_DB } },
+    [WQ_CMP_RATIO] = { "cmpratio", { "RATIO", 1, 20, 4, K_EXP, F_RATIO } },
+    [WQ_CMP_ATK]   = { "cmpatk",   { "ATTACK", 0.0005f, 0.2f, 0.01f, K_EXP, F_SEC } },
+    [WQ_CMP_REL]   = { "cmprel",   { "RELEASE", 0.02f, 2, 0.25f, K_EXP, F_SEC } },
+    [WQ_CMP_GAIN]  = { "cmpgain",  { "MAKEUP", 0, 24, 4, K_KNOB, F_DB } },
+    [WQ_CHO_ON]    = WV_ONOFF("cho", "CHORUS", 1),
+    [WQ_CHO_RATE]  = { "chorate",  { "RATE", 0.05f, 5, 0.35f, K_EXP, F_HZ } },
+    [WQ_CHO_DEPTH] = { "chodepth", { "DEPTH", 0, 1, 0.5f, K_KNOB, F_PCT } },
+    [WQ_CHO_MIX]   = { "chomix",   { "MIX", 0, 1, 0.35f, K_KNOB, F_PCT } },
+    [WQ_FLG_ON]    = WV_ONOFF("flg", "FLANGER", 0),
+    [WQ_FLG_RATE]  = { "flgrate",  { "RATE", 0.02f, 5, 0.15f, K_EXP, F_HZ } },
+    [WQ_FLG_DEPTH] = { "flgdepth", { "DEPTH", 0, 1, 0.6f, K_KNOB, F_PCT } },
+    [WQ_FLG_FB]    = { "flgfb",    { "FEEDBACK", -0.95f, 0.95f, 0.5f, K_KNOB, F_NUM } },
+    [WQ_FLG_MIX]   = { "flgmix",   { "MIX", 0, 1, 0.5f, K_KNOB, F_PCT } },
+    [WQ_PHS_ON]    = WV_ONOFF("phs", "PHASER", 0),
+    [WQ_PHS_RATE]  = { "phsrate",  { "RATE", 0.02f, 5, 0.2f, K_EXP, F_HZ } },
+    [WQ_PHS_DEPTH] = { "phsdepth", { "DEPTH", 0, 1, 0.7f, K_KNOB, F_PCT } },
+    [WQ_PHS_FB]    = { "phsfb",    { "FEEDBACK", 0, 0.9f, 0.4f, K_KNOB, F_PCT } },
+    [WQ_PHS_MIX]   = { "phsmix",   { "MIX", 0, 1, 0.5f, K_KNOB, F_PCT } },
+    [WQ_DLY_ON]    = WV_ONOFF("dly", "DELAY", 1),
+    [WQ_DLY_TIME]  = { "dlytime",  { "TIME", 0.02f, 2.5f, 0.42f, K_EXP, F_SEC } },
+    [WQ_DLY_FB]    = { "dlyfb",    { "FEEDBACK", 0, 0.95f, 0.45f, K_KNOB, F_PCT } },
+    [WQ_DLY_PING]  = { "dlyping",  { "PING-PONG", 0, 1, 0.6f, K_KNOB, F_PCT } },
+    [WQ_DLY_TONE]  = { "dlytone",  { "TONE", 0, 1, 0.45f, K_KNOB, F_PCT } },
+    [WQ_DLY_MIX]   = { "dlymix",   { "MIX", 0, 1, 0.25f, K_KNOB, F_PCT } },
+    [WQ_PLT_ON]    = WV_ONOFF("plt", "PLATE REVERB", 1),
+    [WQ_PLT_PRE]   = { "pltpre",   { "PREDELAY", 0, 0.2f, 0.02f, K_KNOB, F_SEC } },
+    [WQ_PLT_DECAY] = { "pltdecay", { "DECAY", 0.05f, 0.97f, 0.7f, K_KNOB, F_PCT } },
+    [WQ_PLT_DAMP]  = { "pltdamp",  { "DAMP", 0, 1, 0.35f, K_KNOB, F_PCT } },
+    [WQ_PLT_MIX]   = { "pltmix",   { "MIX", 0, 1, 0.35f, K_KNOB, F_PCT } },
+};
+
+typedef struct { const char *name; int on, n, k[5]; } WvFx;
+#define WV_NFX 10
+static const WvFx WV_FX[WV_NFX] = {
+    { "FILTER",       WQ_FLT_ON, 4, { WQ_FLT_MODE, WQ_FLT_CUT, WQ_FLT_RES, WQ_FLT_ENV } },
+    { "EQ",           WQ_EQ_ON,  4, { WQ_EQ_LOW, WQ_EQ_MID, WQ_EQ_FREQ, WQ_EQ_HIGH } },
+    { "SATURATION",   WQ_SAT_ON, 4, { WQ_SAT_DRIVE, WQ_SAT_BIAS, WQ_SAT_TONE, WQ_SAT_MIX } },
+    { "DISTORTION",   WQ_DST_ON, 4, { WQ_DST_TYPE, WQ_DST_DRIVE, WQ_DST_TONE, WQ_DST_MIX } },
+    { "COMPRESSOR",   WQ_CMP_ON, 5, { WQ_CMP_THR, WQ_CMP_RATIO, WQ_CMP_ATK, WQ_CMP_REL, WQ_CMP_GAIN } },
+    { "CHORUS",       WQ_CHO_ON, 3, { WQ_CHO_RATE, WQ_CHO_DEPTH, WQ_CHO_MIX } },
+    { "FLANGER",      WQ_FLG_ON, 4, { WQ_FLG_RATE, WQ_FLG_DEPTH, WQ_FLG_FB, WQ_FLG_MIX } },
+    { "PHASER",       WQ_PHS_ON, 4, { WQ_PHS_RATE, WQ_PHS_DEPTH, WQ_PHS_FB, WQ_PHS_MIX } },
+    { "DELAY",        WQ_DLY_ON, 5, { WQ_DLY_TIME, WQ_DLY_FB, WQ_DLY_PING, WQ_DLY_TONE, WQ_DLY_MIX } },
+    { "PLATE REVERB", WQ_PLT_ON, 4, { WQ_PLT_PRE, WQ_PLT_DECAY, WQ_PLT_DAMP, WQ_PLT_MIX } },
+};
+
+// ---- state ----------------------------------------------------------------
+
+typedef struct {
+    float fic1[2], fic2[2];                               // filter
+    Biquad eq[3][2]; float eqKey[4];                      // eq
+    float satLp[2], dstLp[2][2], hold[2]; int holdN;     // saturation, distortion
+    float gr;                                             // compressor gain reduction (dB)
+    float cho[2][WV_CHO], choPh; int cw;                  // chorus
+    float flg[2][WV_FLG], flgPh; int fw;                  // flanger
+    float apz[2][6], phsPh, phsFb[2];                     // phaser
+    float dly[2][WV_DLY], dt, dlp[2]; int dw;             // delay
+    float pre[16384], ap[4][1024], mapL[2048], mapR[2048];   // plate (Dattorro)
+    float dL1[8192], dL2[8192], dR1[8192], dR2[8192], apL2[4096], apR2[8192];
+    float dampL, dampR, lastL, lastR, pph; int pw;
+} WvFxSt;
+
+typedef struct {   // what a table build is made from, copied when it starts
+    int   wave, userMode, mt[WV_SLOTS];
+    float ma[WV_SLOTS], user[WV_UPTS], part[WV_HARM];
+} WvSnap;
+
+enum { WD_NONE, WD_KNOB, WD_CURVE, WD_EDIT };
+
+typedef struct {
+    float q[WQ_N];
+    // wavetable: built by the UI into tab[1 - cur], taken by the audio via pending
+    float *tab[2];
+    volatile int cur, pending;
+    unsigned sig;
+    bool  building; int bf, dst;
+    WvSnap snap;
+    float base[WV_N];
+    float disp[WV_F][WV_DISP]; bool dispOk;
+    // user table: a drawn shape or drawn partials
+    float user[WV_UPTS], part[WV_HARM];
+    int   userMode; bool userSet; unsigned userVer;
+    // envelope, rendered one block ahead
+    int   stage; bool gate, trig; float env, cA, cD, cR;
+    float envBuf[WV_BLOCK], outL[WV_BLOCK], outR[WV_BLOCK]; int bi;
+    // notes and voices
+    float pitch[WV_NOTES]; bool was[WV_NOTES];
+    float ph[WV_NOTES][WV_MAXV];
+    float ent[WV_MAXV][5], entT[WV_MAXV][5];
+    float lph;
+    float vx[WV_MAXV], vl[WV_MAXV], va[WV_MAXV], vp[WV_MAXV]; int vn, dnotes; float dpos;   // for the UI
+    WvFxSt fx;
+    // UI
+    int   pick;            // -1, 0 = wave picker, 1..4 = morpher picker for that slot
+    bool  drawMode;
+    int   curve, drag, dragQ, dragH, lastKnob, lastJ;
+    float dragT, lastY, lastV;
+    double lastClick;
+} WavorSt;
+
+// ---- tables: FFT, waves, morphers ----------------------------------------
+
+static void wv_fft(float *re, float *im, int n, bool inv)
+{
+    for (int i = 1, j = 0; i < n; i++) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) { float t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        int half = len >> 1, step = WV_N / len;
+        for (int i = 0; i < n; i += len)
+            for (int k = 0; k < half; k++) {
+                float wr = wv_cs[k * step], wi = inv ? wv_sn[k * step] : -wv_sn[k * step];
+                int a = i + k, b = a + half;
+                float tr = re[b] * wr - im[b] * wi, ti = re[b] * wi + im[b] * wr;
+                re[b] = re[a] - tr; im[b] = im[a] - ti;
+                re[a] += tr;        im[a] += ti;
+            }
+    }
+}
+
+static float wv_hash(unsigned x)
+{
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return (x & 0xffffff) / 16777216.0f;
+}
+
+static bool wv_isprime(int n)
+{
+    if (n < 2) return false;
+    for (int d = 2; d * d <= n; d++) if (n % d == 0) return false;
+    return true;
+}
+
+// Remove DC and scale to peak 1, boosting a near-silent cycle at most 20x so
+// a filter that removes (almost) everything stays (almost) silent.
+static void wv_normalize(float *x, int n)
+{
+    float mean = 0, pk = 0;
+    for (int i = 0; i < n; i++) mean += x[i];
+    mean /= n;
+    for (int i = 0; i < n; i++) { x[i] -= mean; pk = fmaxf(pk, fabsf(x[i])); }
+    float g = 1 / fmaxf(pk, 0.05f);
+    for (int i = 0; i < n; i++) x[i] *= g;
+}
+
+static float wv_at(const float *x, float ph)   // cyclic, linear interpolation
+{
+    float p = (ph - floorf(ph)) * WV_N;
+    int i = (int)p;
+    float f = p - i;
+    int i0 = i & (WV_N - 1), i1 = (i + 1) & (WV_N - 1);
+    return x[i0] + f * (x[i1] - x[i0]);
+}
+
+static float wv_fold(float v) { return 1 - 4 * fabsf(fractf((v + 1) * 0.25f) - 0.5f); }
+
+static void wv_from_harm(float *y, const float *amp, int nh)   // sum of sines, amp[h] for h = 1..nh
+{
+    static float re[WV_N], im[WV_N];
+    memset(re, 0, sizeof re); memset(im, 0, sizeof im);
+    for (int h = 1; h <= nh && h < WV_HALF; h++) { im[h] = -amp[h] * WV_HALF; im[WV_N - h] = amp[h] * WV_HALF; }
+    wv_fft(re, im, WV_N, true);
+    for (int i = 0; i < WV_N; i++) y[i] = re[i] / WV_N;
+}
+
+// Magnitudes of partials 1..WV_HARM of a cycle, scaled to a maximum of 1.
+static void wv_partials_of(const float *x, int len, float *part)
+{
+    float mx = 0;
+    for (int h = 1; h <= WV_HARM; h++) {
+        double c = 0, s = 0;
+        for (int i = 0; i < len; i++) { double a = TAU * h * i / len; c += x[i] * cos(a); s += x[i] * sin(a); }
+        part[h - 1] = (float)sqrt(c * c + s * s);
+        mx = fmaxf(mx, part[h - 1]);
+    }
+    for (int h = 0; h < WV_HARM; h++) part[h] = mx > 0 ? part[h] / mx : 0;
+}
+
+// Spectral envelope of a vowel (formants for a voice around 130 Hz).
+static float wv_vowel(int v, float hz)
+{
+    static const float F[5][3] = { { 800, 1150, 2900 }, { 400, 1600, 2700 }, { 300, 2300, 3000 }, { 450, 800, 2830 }, { 325, 700, 2530 } };
+    static const float G[3] = { 1, 0.5f, 0.25f }, B[3] = { 110, 140, 200 };
+    float e = 0.02f;
+    for (int k = 0; k < 3; k++) { float d = (hz - F[v][k]) / B[k]; e += G[k] * expf(-0.5f * d * d); }
+    return e;
+}
+
+// One of the 64 waves into y (WV_N samples), peak 1.
+static void wv_wave(int w, float *y)
+{
+    static float amp[WV_HALF];
+    memset(amp, 0, sizeof amp);
+    int nh = 0;
+#define WH(h, a) do { amp[h] = (a); if ((h) > nh) nh = (h); } while (0)
+    switch (w) {
+    case 0:  WH(1, 1); break;
+    case 9:  for (int h = 1; h <= 256; h++) WH(h, powf((float)h, -1.6f)); break;
+    case 14: for (int h = 1; h <= 256; h++) WH(h, 1.0f / (h * h)); break;
+    case 16: WH(1, 1); WH(2, 0.5f); break;
+    case 17: WH(1, 1); WH(3, 0.45f); break;
+    case 18: WH(1, 1); WH(2, 0.7f); WH(4, 0.5f); WH(8, 0.25f); break;
+    case 19: { static const float a[] = { 0, 1, .8f, .6f, .6f, 0, .4f, 0, .35f, 0, .2f, 0, .15f, 0, 0, 0, .1f }; for (int h = 1; h <= 16; h++) WH(h, a[h]); } break;
+    case 20: { static const float a[] = { 0, .6f, 1, .9f, .3f, .15f, .4f, 0, .3f }; for (int h = 1; h <= 8; h++) WH(h, a[h]); } break;
+    case 21: WH(1, 1); WH(2, 0.3f); WH(3, 0.12f); WH(4, 0.06f); WH(5, 0.03f); break;
+    case 22: for (int h = 1; h <= 64; h++) WH(h, (h & 1) ? 1.0f / h : 0.03f / h); break;
+    case 23: for (int h = 1; h <= 64; h++) WH(h, h * expf(-h / 3.5f)); break;
+    case 24: for (int h = 1; h <= 96; h++) { float d = (h - 7) / 3.0f; WH(h, powf((float)h, -0.6f) * (1 + 2 * expf(-0.5f * d * d)) * expf(-h / 40.0f)); } break;
+    case 25: for (int h = 1; h <= 256; h++) WH(h, expf(-h / 48.0f) / h); break;
+    case 26: case 27: case 28: case 29: case 30:
+        for (int h = 1; h <= 96; h++) WH(h, wv_vowel(w - 26, h * 130.0f) * powf((float)h, -0.3f));
+        break;
+    case 31: for (int h = 1; h <= 96; h++) WH(h, (wv_vowel(0, h * 130.0f) + wv_vowel(3, h * 130.0f)) * powf((float)h, -0.4f)); break;
+    case 32: WH(1, 1); WH(4, .6f); WH(7, .45f); WH(11, .35f); WH(15, .25f); WH(20, .15f); break;
+    case 33: WH(1, 1); WH(5, .5f); WH(9, .35f); WH(13, .3f); WH(17, .2f); WH(21, .15f); break;
+    case 34: WH(1, 1); WH(3, .9f); WH(5, .35f); WH(7, .1f); break;
+    case 35: for (int h = 1; h <= 128; h++) WH(h, h % 3 == 0 ? 0 : (h >= 5 && h <= 9 ? 2.0f : 1.0f) / h); break;
+    case 36: for (int h = 1; h <= 128; h++) WH(h, (h == 1 || wv_isprime(h)) ? powf((float)h, -0.7f) : 0); break;
+    case 37: { static const int f[] = { 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144 }; for (int i = 0; i < 11; i++) WH(f[i], 1 / sqrtf((float)f[i])); } break;
+    case 38: for (int h = 1; h <= 256; h <<= 1) WH(h, 1 / sqrtf((float)h)); break;
+    case 39: for (int h = 1; h <= 128; h += 2) WH(h, 1 / sqrtf((float)h)); break;
+    case 40: WH(1, 1); for (int h = 2; h <= 128; h += 2) WH(h, powf((float)h, -0.7f)); break;
+    case 41: for (int h = 1; h <= 16; h++) WH(h, 1); break;
+    case 42: for (int h = 1; h <= 64; h++) WH(h, 1); break;
+    case 43: case 44: case 45: {
+        float c = w == 43 ? 3 : w == 44 ? 8 : 18, bw = w == 43 ? 1 : w == 44 ? 2 : 3;
+        for (int h = 1; h <= 128; h++) { float d = (h - c) / bw; WH(h, (0.12f + expf(-0.5f * d * d)) / sqrtf((float)h)); }
+    } break;
+    case 46: for (int h = 1; h <= 64; h++) WH(h, (0.2f + wv_hash(h * 31 + 7)) * powf((float)h, -0.8f)); break;
+    case 47: WH(1, 1); for (int h = 2; h <= 128; h++) { float r = wv_hash(h * 97 + 3); WH(h, r > 0.75f ? r / sqrtf((float)h) : 0); } break;
+    }
+#undef WH
+    if (nh) { wv_from_harm(y, amp, nh); wv_normalize(y, WV_N); return; }
+    for (int i = 0; i < WV_N; i++) {
+        float t = i / (float)WV_N, s1 = sinf(TAU * t), v = 0;
+        float saw = 2 * fractf(t + 0.5f) - 1, tri = 1 - 4 * fabsf(fractf(t + 0.25f) - 0.5f), sq = t < 0.5f ? 1.0f : -1.0f;
+        switch (w) {
+        case 1:  v = tri; break;
+        case 2:  v = sq; break;
+        case 3:  { float ts = floorf(t * 16) / 16; v = roundf((2 * fractf(ts + 0.5f) - 1) * 4) / 4; } break;
+        case 4:  v = saw; break;
+        case 5:  v = t < 0.25f ? 1 : -1; break;
+        case 6:  v = t < 0.125f ? 1 : -1; break;
+        case 7:  v = fmaxf(s1, 0); break;
+        case 8:  v = fabsf(s1); break;
+        case 10: v = tanhf(3 * s1); break;
+        case 11: v = clampf(2.2f * tri, -1, 1); break;
+        case 12: v = roundf(s1 * 2) / 2; break;
+        case 13: v = floorf((tri * 0.5f + 0.5f) * 15.999f) / 7.5f - 1; break;
+        case 15: v = saw + 0.7f * (2 * fractf(2 * t + 0.75f) - 1); break;
+        case 48: { float u = t * 128; int k = (int)u; float f = u - k, a = wv_hash(k & 127) * 2 - 1, b = wv_hash((k + 1) & 127) * 2 - 1;
+                   v = a + (b - a) * (f * f * (3 - 2 * f)); } break;
+        case 49: v = (1 - t) * cosf(TAU * 6 * t); break;
+        case 50: v = (1 - 2 * fabsf(t - 0.5f)) * cosf(TAU * 8 * t); break;
+        case 51: { float d = 0.08f, p = t < d ? 0.5f * t / d : 0.5f + 0.5f * (t - d) / (1 - d); v = -cosf(TAU * p); } break;
+        case 52: v = sinf(TAU * t + 2.0f * s1); break;
+        case 53: v = sinf(TAU * t + 1.6f * sinf(TAU * 2 * t)); break;
+        case 54: v = sinf(TAU * t + 1.3f * sinf(TAU * 3 * t)); break;
+        case 55: v = sinf(TAU * t + 2.2f * sinf(TAU * 7 * t)); break;
+        case 56: v = 2 * fractf(t * 2.6f) - 1; break;
+        case 57: v = sinf(TAU * 3.4f * t); break;
+        case 58: v = sinf(3.14159265f * 1.8f * s1); break;
+        case 59: { float s3 = s1 * s1 * s1, s5 = s3 * s1 * s1; v = 0.5f * (4 * s3 - 3 * s1) + 0.5f * (16 * s5 - 20 * s3 + 5 * s1); } break;
+        case 60: v = tanhf(3 * saw); break;
+        case 61: { float d = (t - 0.5f) / 0.025f; v = expf(-d * d); } break;
+        case 62: { float d1 = (t - 0.25f) / 0.02f, d2 = (t - 0.75f) / 0.02f; v = expf(-d1 * d1) - expf(-d2 * d2); } break;
+        case 63: v = 0.6f * saw + 0.5f * sq + 0.4f * s1; break;
+        }
+        y[i] = v;
+    }
+    wv_normalize(y, WV_N);
+}
+
+// Gain of partial h for the spectral-filter morphers.
+static float wv_gain(int type, float a, int h)
+{
+    float lh = log2f((float)h);
+    switch (type) {
+    case 38: return 1 + a * (2 * wv_hash(h * 7919u) - 1);
+    case 40: { float c = 512 * exp2f(-8.5f * a), r = h / c; return 1 / sqrtf(1 + r * r * r * r); }
+    case 41: { float c = 0.3f * exp2f(8 * a), r = c / h; return 1 / sqrtf(1 + r * r * r * r); }
+    case 42: { float bw = 8 * (1 - a) + 0.35f, d = (lh - 3) / bw; return expf(-0.5f * d * d); }
+    case 43: { float d = (lh - (1 + 5 * a)) / 0.3f; return 1 + 6 * fminf(1, 4 * a) * expf(-0.5f * d * d); }
+    case 44: { float P = 2 + 6 * a; return 1 - fminf(1, 2 * a) * (0.5f + 0.5f * cosf(TAU * h / P)); }
+    case 45: { float d = (lh - (1 + 6 * a)) / 0.2f; return 1 - fminf(1, 4 * a) * expf(-0.5f * d * d); }
+    case 46: return powf((float)h, -1.5f * a);
+    case 47: return powf((float)h, 1.2f * a);
+    case 48: return (h & 1) ? 1 : 1 - a;
+    case 49: return (h & 1) && h > 1 ? 1 - a : 1;
+    case 50: { int n = 1 + (int)(a * 7.99f); return (h - 1) % n == 0 ? 1 : 0; }
+    case 51: return h == 1 || wv_isprime(h) ? 1 : 1 - a;
+    case 52: return (h & (h - 1)) == 0 ? 1 : 1 - a;
+    case 56: {   // vowels A > E > I > O > U across the amount
+        float v = a * 4, hz = h * 130.0f;
+        int v0 = v >= 4 ? 3 : (int)v;
+        float f = v - v0, e = (1 - f) * wv_vowel(v0, hz) + f * wv_vowel(v0 + 1, hz);
+        return 1 + fminf(1, 4 * a) * (e - 1);
+    }
+    }
+    return 1;
+}
+
+// Apply morpher `type` with amount a (0 = no change) to a cycle with peak 1.
+static void wv_morph(int type, float a, float *x)
+{
+    static float src[WV_N], re[WV_N], im[WV_N], mag[WV_HALF], pha[WV_HALF], nre[WV_HALF], nim[WV_HALF];
+    memcpy(src, x, sizeof src);
+    bool spec = type == 11 || type == 12 || type == 13 || type == 14 || type == 23 || type == 38 ||
+                (type >= 40 && type <= 56) || type == 60 || type == 61;
+    if (spec) {
+        memcpy(re, x, sizeof re); memset(im, 0, sizeof im);
+        wv_fft(re, im, WV_N, false);
+        float mx = 0;
+        for (int h = 1; h < WV_HALF; h++) { mag[h] = hypotf(re[h], im[h]); pha[h] = atan2f(im[h], re[h]); mx = fmaxf(mx, mag[h]); }
+        mag[0] = 0;
+        switch (type) {
+        case 11: case 12: {   // shift every partial up / down by up to 24 places
+            float sft = 24 * a; int s0 = (int)sft; float f = sft - s0;
+            for (int h = 1; h < WV_HALF; h++) {
+                int k0 = type == 11 ? h - s0 : h + s0, k1 = type == 11 ? k0 - 1 : k0 + 1;
+                float m0 = k0 >= 1 && k0 < WV_HALF ? mag[k0] : 0, m1 = k1 >= 1 && k1 < WV_HALF ? mag[k1] : 0;
+                float p = k0 >= 1 && k0 < WV_HALF ? pha[k0] : 0, m = m0 * (1 - f) + m1 * f;
+                nre[h] = m * cosf(p); nim[h] = m * sinf(p);
+            }
+            for (int h = 1; h < WV_HALF; h++) { re[h] = nre[h]; im[h] = nim[h]; }
+        } break;
+        case 13: case 14: {   // move partial h to h * r
+            float r = type == 13 ? 1 + 3 * a : 1 / (1 + 3 * a);
+            memset(nre, 0, sizeof nre); memset(nim, 0, sizeof nim);
+            for (int h = 1; h < WV_HALF; h++) {
+                float t = h * r; int k = (int)t; float f = t - k;
+                if (k >= 1 && k < WV_HALF)         { nre[k] += re[h] * (1 - f); nim[k] += im[h] * (1 - f); }
+                if (k + 1 >= 1 && k + 1 < WV_HALF) { nre[k + 1] += re[h] * f;  nim[k + 1] += im[h] * f; }
+            }
+            for (int h = 1; h < WV_HALF; h++) { re[h] = nre[h]; im[h] = nim[h]; }
+        } break;
+        case 23: case 60:     // rotate phases: a chirp, or at random
+            for (int h = 1; h < WV_HALF; h++) {
+                float p = pha[h] + (type == 23 ? a * 3.14159265f * h * h / 64 : a * TAU * wv_hash(h * 2971u));
+                re[h] = mag[h] * cosf(p); im[h] = mag[h] * sinf(p);
+            }
+            break;
+        case 53: {   // blur the magnitudes across neighbours
+            float sg = 0.3f + 4 * a;
+            for (int h = 1; h < WV_HALF; h++) {
+                float s = 0, ws = 0;
+                for (int k = -12; k <= 12; k++) {
+                    int j = h + k;
+                    if (j < 1 || j >= WV_HALF) continue;
+                    float w = expf(-0.5f * k * k / (sg * sg));
+                    s += mag[j] * w; ws += w;
+                }
+                float m = s / ws;
+                re[h] = m * cosf(pha[h]); im[h] = m * sinf(pha[h]);
+            }
+        } break;
+        case 54: case 55: case 61:
+            for (int h = 1; h < WV_HALF; h++) {
+                float m = mag[h];
+                if (type == 54 && mx > 0) m = mx * powf(m / mx, 1 + 3 * a);
+                if (type == 55) m = h <= 32 ? m + a * (mag[33 - h] - m) : m * (1 - a);
+                if (type == 61) { float th = a * 0.5f * mx; if (m < th) m *= (m / th) * (m / th); }
+                re[h] = m * cosf(pha[h]); im[h] = m * sinf(pha[h]);
+            }
+            break;
+        default:
+            for (int h = 1; h < WV_HALF; h++) { float g = wv_gain(type, a, h); re[h] *= g; im[h] *= g; }
+        }
+        re[0] = im[0] = re[WV_HALF] = im[WV_HALF] = 0;
+        for (int h = 1; h < WV_HALF; h++) { re[WV_N - h] = re[h]; im[WV_N - h] = -im[h]; }
+        wv_fft(re, im, WV_N, true);
+        for (int i = 0; i < WV_N; i++) x[i] = re[i] / WV_N;
+        return;
+    }
+    if (type == 36) {   // slew limit, twice round the cycle
+        float mx = 2 / (1 + a * a * 400), y = src[0];
+        for (int pass = 0; pass < 2; pass++)
+            for (int i = 0; i < WV_N; i++) { y += clampf(src[i] - y, -mx, mx); x[i] = y; }
+        return;
+    }
+    for (int i = 0; i < WV_N; i++) {
+        float p = i / (float)WV_N, s = src[i], v = s;
+        switch (type) {
+        case 0: case 1: {
+            float m = type == 0 ? 0.5f - 0.45f * a : 0.5f + 0.45f * a;
+            v = wv_at(src, p < m ? 0.5f * p / m : 0.5f + 0.5f * (p - m) / (1 - m));
+        } break;
+        case 2:  v = wv_at(src, p - 0.9f * a * sinf(2 * TAU * p) / (2 * TAU)); break;
+        case 3:  v = wv_at(src, p + 0.9f * a * sinf(2 * TAU * p) / (2 * TAU)); break;
+        case 4:  v = s + a * (wv_at(src, p < 0.5f ? 2 * p : 2 - 2 * p) - s); break;
+        case 5:  { float w = 1 - 0.85f * a; v = p < w ? wv_at(src, p / w) : src[0]; } break;
+        case 6:  { float u = 2 * p - 1; v = wv_at(src, 0.5f + 0.5f * copysignf(powf(fabsf(u), 1 / (1 + 3 * a)), u)); } break;
+        case 7:  v = p < 0.5f ? s : s * (1 - 2 * a); break;
+        case 8:  v = wv_at(src, p * (1 + 7 * a)); break;
+        case 9:  { float w = 0.5f - 0.5f * cosf(TAU * p); v = wv_at(src, p * (1 + 7 * a)) * (1 + fminf(1, 4 * a) * (w - 1)); } break;
+        case 10: { float r = 1 + 7 * a; int n0 = (int)r; float f = r - n0; v = wv_at(src, p * n0) * (1 - f) + wv_at(src, p * (n0 + 1)) * f; } break;
+        case 15: v = s + a * wv_at(src, 2 * p); break;
+        case 16: case 17: case 18: case 19: {
+            static const float K[4] = { 1, 2, 3, 7 };
+            v = wv_at(src, p + a * 0.25f * sinf(TAU * K[type - 16] * p));
+        } break;
+        case 20: v = wv_at(src, p + a * 0.2f * s); break;
+        case 21: v = s * (1 + a * (1.5f * sinf(TAU * 3 * p) - 1)); break;
+        case 22: v = s * (1 + a * (cosf(TAU * 2 * p) - 1)); break;
+        case 24: { float g = 1 + 9 * a; v = tanhf(g * s) / tanhf(g); } break;
+        case 25: v = clampf((1 + 9 * a) * s, -1, 1); break;
+        case 26: v = wv_fold(s * (1 + 5 * a)); break;
+        case 27: { float b = 0.6f * a; v = tanhf((1 + 3 * a) * s + b) - tanhf(b); } break;
+        case 28: v = s + a * (fabsf(s) - s); break;
+        case 29: v = copysignf(powf(fabsf(s), 1 / (1 + 3 * a)), s); break;
+        case 30: v = copysignf(powf(fabsf(s), 1 + 4 * a), s); break;
+        case 31: v = 2 * fractf((s * (1 + 4 * a) + 1) * 0.5f) - 1; break;
+        case 32: { float L = exp2f(10 - 8.5f * a); v = roundf(s * L) / L; } break;
+        case 33: { int S = 1 + (int)(a * 127); v = src[(i / S) * S]; } break;
+        case 34: v = s + a * (2 * s * s - 1 - s); break;
+        case 35: v = s + a * (4 * s * s * s - 3 * s - s); break;
+        case 37: v = s + a * 0.7f * (2 * wv_hash(i * 2654435761u) - 1); break;
+        case 39: { int j = ((i / 128) & 1) ? i - 128 : i; v = s + a * (src[j] - s); } break;
+        case 57: v = s * (1 + a * (0.5f - 0.5f * cosf(TAU * p) - 1)); break;
+        case 58: v = s + fminf(1, 3 * a) * (1 - p) * (1 - p) * sinf(TAU * (2 + 14 * a) * p); break;
+        case 59: v = s + fminf(1, 4 * a) * (sinf(1.5707963f * s * (1 + 3 * a)) - s); break;
+        case 62: v = s + a * (sinf(TAU * p) - s); break;
+        case 63: v = s + a * (2 * fractf(p + 0.5f) - 1 - s); break;
+        }
+        x[i] = v;
+    }
+}
+
+static void wv_static_init(void)
+{
+    if (wv_inited) return;
+    wv_inited = true;
+    for (int k = 0; k < WV_HALF; k++) { wv_cs[k] = cosf(TAU * k / WV_N); wv_sn[k] = sinf(TAU * k / WV_N); }
+    int off = 0;
+    for (int k = 0; k < WV_LV; k++) {
+        wv_lsize[k] = 4 * (512 >> k) > 64 ? 4 * (512 >> k) : 64;
+        wv_loff[k] = off;
+        off += wv_lsize[k] + 1;
+    }
+    static float y[WV_N];
+    for (int w = 0; w < WV_NWAVE; w++) {
+        wv_wave(w, y);
+        for (int j = 0; j < 48; j++) wv_thumb[w][j] = y[j * WV_N / 48];
+    }
+}
+
+// ---- building the table (UI side) -----------------------------------------
+
+static void wv_snapshot(const WavorSt *s, WvSnap *sn)
+{
+    memset(sn, 0, sizeof *sn);
+    sn->wave = clampi((int)s->q[WQ_WAVE], 0, WV_USER);
+    sn->userMode = s->userMode;
+    for (int k = 0; k < WV_SLOTS; k++) { sn->mt[k] = clampi((int)s->q[WQ_M1T + 2 * k], 0, 63); sn->ma[k] = s->q[WQ_M1A + 2 * k]; }
+    memcpy(sn->user, s->user, sizeof sn->user);
+    memcpy(sn->part, s->part, sizeof sn->part);
+}
+
+static unsigned wv_signature(const WavorSt *s)
+{
+    WvSnap sn;
+    wv_snapshot(s, &sn);
+    unsigned h = 2166136261u;
+    const unsigned char *b = (const unsigned char *)&sn;
+    for (size_t i = 0; i < offsetof(WvSnap, user); i++) h = (h ^ b[i]) * 16777619u;
+    if (sn.wave == WV_USER) h = (h ^ s->userVer) * 16777619u;
+    return h;
+}
+
+static void wv_make_base(WavorSt *s)
+{
+    const WvSnap *sn = &s->snap;
+    if (sn->wave < WV_NWAVE) { wv_wave(sn->wave, s->base); return; }
+    if (sn->userMode == 1) {
+        static float amp[WV_HARM + 1];
+        for (int h = 1; h <= WV_HARM; h++) amp[h] = sn->part[h - 1];
+        wv_from_harm(s->base, amp, WV_HARM);
+    } else
+        for (int i = 0; i < WV_N; i++) {
+            float p = i * (float)WV_UPTS / WV_N;
+            int j = (int)p;
+            float f = p - j;
+            s->base[i] = sn->user[j] + f * (sn->user[(j + 1) % WV_UPTS] - sn->user[j]);
+        }
+    wv_normalize(s->base, WV_N);
+}
+
+// Frame f: morph the base by t = f / (WV_F - 1) of every slot's amount, then
+// band-limit it into every mip level, plus the brighter twin.
+static void wv_build_frame(WavorSt *s, float *dst, int f)
+{
+    static float x[WV_N], re[WV_N], im[WV_N], R[WV_N], I[WV_N];
+    float t = f / (float)(WV_F - 1);
+    memcpy(x, s->base, sizeof x);
+    for (int k = 0; k < WV_SLOTS; k++) {
+        float a = s->snap.ma[k] * t;
+        if (a > 1e-4f) { wv_morph(s->snap.mt[k], clampf(a, 0, 1), x); wv_normalize(x, WV_N); }
+    }
+    float rmsA = 0;
+    for (int v = 0; v < 2; v++) {
+        for (int i = 0; i < WV_N; i++) re[i] = v ? tanhf(2.5f * x[i]) : x[i];
+        memset(im, 0, sizeof im);
+        wv_fft(re, im, WV_N, false);
+        if (v) for (int h = 1; h < WV_HALF; h++) { float g = powf((float)h, 0.45f); re[h] *= g; im[h] *= g; }
+        float gain = 1;
+        for (int k = 0; k < WV_LV; k++) {
+            int n = wv_lsize[k], H = 512 >> k;
+            float *o = dst + (size_t)(f * 2 + v) * WV_T + wv_loff[k];
+            memset(R, 0, n * sizeof *R); memset(I, 0, n * sizeof *I);
+            for (int h = 1; h <= H; h++) { R[h] = re[h]; I[h] = im[h]; R[n - h] = re[h]; I[n - h] = -im[h]; }
+            wv_fft(R, I, n, true);
+            if (k == 0) {   // one gain for all levels, from the full-band cycle
+                float pk = 0, rms = 0;
+                for (int i = 0; i < n; i++) { float y = R[i] / WV_N; pk = fmaxf(pk, fabsf(y)); rms += y * y; }
+                rms = sqrtf(rms / n);
+                if (!v) { gain = 1 / fmaxf(pk, 0.05f); rmsA = rms * gain; }
+                else gain = fminf(rms > 1e-9f ? rmsA / rms : 1, 1.6f / fmaxf(pk, 1e-6f));
+            }
+            for (int i = 0; i < n; i++) o[i] = R[i] / WV_N * gain;
+            o[n] = o[0];
+        }
+    }
+}
+
+// Called every video frame: (re)build the table when the wave or the
+// morphers changed, within `budget` seconds (a huge budget builds it all now).
+static void wv_work(Module *m, double budget)
+{
+    WavorSt *s = m->st;
+    if (!s || !s->tab[0] || !s->tab[1]) return;
+    if (s->pending >= 0 && UI_OWNS_AUDIO) { s->cur = s->pending; s->pending = -1; }
+    if (!s->building) {
+        unsigned sig = wv_signature(s);
+        if (sig == s->sig && s->dispOk) return;
+        if (s->pending >= 0) return;   // the audio has not taken the last table yet
+        wv_snapshot(s, &s->snap);
+        s->sig = sig; s->building = true; s->bf = 0; s->dst = 1 - s->cur;
+        wv_make_base(s);
+    }
+    bool all = budget > 1e6;
+    double t0 = all ? 0 : GetTime();
+    while (s->bf < WV_F && (all || GetTime() - t0 < budget)) wv_build_frame(s, s->tab[s->dst], s->bf++);
+    if (s->bf < WV_F) return;
+    s->building = false;
+    const float *lv = s->tab[s->dst] + wv_loff[2];
+    for (int f = 0; f < WV_F; f++)
+        for (int j = 0; j < WV_DISP; j++) s->disp[f][j] = lv[(size_t)f * 2 * WV_T + j * wv_lsize[2] / WV_DISP];
+    s->dispOk = true;
+    s->pending = s->dst;
+    if (UI_OWNS_AUDIO) { s->cur = s->pending; s->pending = -1; }
+}
+
+// ---- audio ----------------------------------------------------------------
+
+static float wv_curve(const float *q, int c, float x)   // x: stereo position -1..1
+{
+    const float *h = q + WQ_CURVE + c * 3;
+    float v = h[1] + x * (h[2] - h[0]) * 0.5f + x * x * ((h[2] + h[0]) * 0.5f - h[1]);
+    return clampf(v, 0, 1);
+}
+
+typedef struct { const float *t; float w; } WvTap;
+
+static void wv_voice_run(const WvTap *tp, int nt, int size, float *ph, float inc, float gl, float gr, float *L, float *R)
+{
+    float p = *ph, fs = (float)size;
+    for (int i = 0; i < WV_BLOCK; i++) {
+        float x = p * fs;
+        int i0 = (int)x;
+        float fr = x - i0, v = 0;
+        for (int k = 0; k < nt; k++) { const float *t = tp[k].t; v += tp[k].w * (t[i0] + fr * (t[i0 + 1] - t[i0])); }
+        L[i] += v * gl; R[i] += v * gr;
+        p += inc;
+        if (p >= 1) p -= 1;
+    }
+    *ph = p;
+}
+
+#define WV_PS(n) ((int)((n) * (SR / 29761.0f)))   // Dattorro's plate lengths at our rate
+
+static float wv_apd(float *b, int mask, int w, int D, float g, float x)   // allpass, integer delay
+{
+    float d = b[(w - D) & mask], v = x + g * d;
+    b[w & mask] = v;
+    return d - g * v;
+}
+
+static float wv_apf(float *b, int mask, int w, float D, float g, float x)   // allpass, fractional delay
+{
+    float rp = w - D;
+    int i0 = (int)floorf(rp);
+    float fr = rp - i0, d = b[i0 & mask] + fr * (b[(i0 + 1) & mask] - b[i0 & mask]), v = x + g * d;
+    b[w & mask] = v;
+    return d - g * v;
+}
+
+static void wv_plate(WvFxSt *f, const float *q, float *L, float *R)
+{
+    float decay = q[WQ_PLT_DECAY], damp = q[WQ_PLT_DAMP] * 0.9f, mix = q[WQ_PLT_MIX];
+    float dd2 = clampf(decay + 0.15f, 0.25f, 0.5f), ex = 8 * (SR / 29761.0f);
+    int pd = clampi((int)(q[WQ_PLT_PRE] * SR), 0, 16000);
+    for (int t = 0; t < WV_BLOCK; t++) {
+        int w = f->pw;
+        f->pre[w & 16383] = (L[t] + R[t]) * 0.5f + 1e-18f;
+        float x = f->pre[(w - pd) & 16383];
+        x = wv_apd(f->ap[0], 1023, w, WV_PS(142), 0.75f, x);
+        x = wv_apd(f->ap[1], 1023, w, WV_PS(107), 0.75f, x);
+        x = wv_apd(f->ap[2], 1023, w, WV_PS(379), 0.625f, x);
+        x = wv_apd(f->ap[3], 1023, w, WV_PS(277), 0.625f, x);
+        f->pph = fractf(f->pph + 0.9f / SR);
+        float mL = WV_PS(672) + ex * (1 + sinf(TAU * f->pph)), mR = WV_PS(908) + ex * (1 + cosf(TAU * f->pph));
+        // left half of the tank
+        f->dL1[w & 8191] = wv_apf(f->mapL, 2047, w, mL, -0.7f, x + decay * f->lastR);
+        f->dampL += (f->dL1[(w - WV_PS(4453)) & 8191] - f->dampL) * (1 - damp);
+        f->dL2[w & 8191] = wv_apd(f->apL2, 4095, w, WV_PS(1800), dd2, f->dampL * decay);
+        float nl = f->dL2[(w - WV_PS(3720)) & 8191];
+        // right half
+        f->dR1[w & 8191] = wv_apf(f->mapR, 2047, w, mR, -0.7f, x + decay * f->lastL);
+        f->dampR += (f->dR1[(w - WV_PS(4217)) & 8191] - f->dampR) * (1 - damp);
+        f->dR2[w & 8191] = wv_apd(f->apR2, 8191, w, WV_PS(2656), dd2, f->dampR * decay);
+        float nr = f->dR2[(w - WV_PS(3163)) & 8191];
+        f->lastL = nl; f->lastR = nr;
+#define WV_TAP(buf, mask, d) (buf)[(w - WV_PS(d)) & (mask)]
+        float yl = 0.6f * (WV_TAP(f->dR1, 8191, 266) + WV_TAP(f->dR1, 8191, 2974) - WV_TAP(f->apR2, 8191, 1913) + WV_TAP(f->dR2, 8191, 1996)
+                         - WV_TAP(f->dL1, 8191, 1990) - WV_TAP(f->apL2, 4095, 187) - WV_TAP(f->dL2, 8191, 1066));
+        float yr = 0.6f * (WV_TAP(f->dL1, 8191, 353) + WV_TAP(f->dL1, 8191, 3627) - WV_TAP(f->apL2, 4095, 1228) + WV_TAP(f->dL2, 8191, 2673)
+                         - WV_TAP(f->dR1, 8191, 2111) - WV_TAP(f->apR2, 8191, 335) - WV_TAP(f->dR2, 8191, 121));
+#undef WV_TAP
+        f->pw = (w + 1) & 0xffffff;
+        L[t] = L[t] * (1 - 0.5f * mix) + yl * mix;
+        R[t] = R[t] * (1 - 0.5f * mix) + yr * mix;
+    }
+}
+
+static void wv_biquad_set(Biquad *b, int type, float f, float db, float qv)   // 0 low shelf, 1 peak, 2 high shelf
+{
+    float A = powf(10, db / 40), w = TAU * f / SR, c = cosf(w), sn = sinf(w);
+    float b0, b1, b2, a0, a1, a2;
+    if (type == 1) {
+        float al = sn / (2 * qv);
+        b0 = 1 + al * A; b1 = -2 * c; b2 = 1 - al * A; a0 = 1 + al / A; a1 = -2 * c; a2 = 1 - al / A;
+    } else {
+        float al = sn / 2 * 1.41421356f, sa = 2 * sqrtf(A) * al, s = type == 0 ? 1 : -1;
+        b0 = A * ((A + 1) - s * (A - 1) * c + sa);
+        b1 = 2 * s * A * ((A - 1) - s * (A + 1) * c);
+        b2 = A * ((A + 1) - s * (A - 1) * c - sa);
+        a0 = (A + 1) + s * (A - 1) * c + sa;
+        a1 = -2 * s * ((A - 1) + s * (A + 1) * c);
+        a2 = (A + 1) + s * (A - 1) * c - sa;
+    }
+    b->b0 = b0 / a0; b->b1 = b1 / a0; b->b2 = b2 / a0; b->a1 = a1 / a0; b->a2 = a2 / a0;
+}
+
+static void wv_fx(Module *m, float *L, float *R, float env)
+{
+    WavorSt *s = m->st;
+    WvFxSt *f = &s->fx;
+    const float *q = s->q;
+    float *ch[2] = { L, R };
+    const int n = WV_BLOCK;
+
+    if (q[WQ_FLT_ON] > 0.5f) {   // state-variable filter, cutoff follows the envelope and CUTOFF
+        float fc = clampf(q[WQ_FLT_CUT] * exp2f(q[WQ_FLT_ENV] * env * 5 + IN(m, 6) * 5), 20, SR * 0.45f);
+        float g = tanf(3.14159265f * fc / SR), k = 2 - 1.95f * q[WQ_FLT_RES];
+        float a1 = 1 / (1 + g * (g + k)), a2 = g * a1, a3 = g * a2;
+        int mode = (int)q[WQ_FLT_MODE];
+        for (int c = 0; c < 2; c++)
+            for (int t = 0; t < n; t++) {
+                float x = ch[c][t], v3 = x - f->fic2[c];
+                float v1 = a1 * f->fic1[c] + a2 * v3, v2 = f->fic2[c] + a2 * f->fic1[c] + a3 * v3;
+                f->fic1[c] = 2 * v1 - f->fic1[c]; f->fic2[c] = 2 * v2 - f->fic2[c];
+                ch[c][t] = mode == 0 ? v2 : mode == 1 ? k * v1 : mode == 2 ? x - k * v1 - v2 : x - k * v1;
+            }
+    }
+    if (q[WQ_EQ_ON] > 0.5f) {    // low shelf 180 Hz, a bell, high shelf 4.5 kHz
+        float key[4] = { q[WQ_EQ_LOW], q[WQ_EQ_MID], q[WQ_EQ_FREQ], q[WQ_EQ_HIGH] };
+        if (memcmp(key, f->eqKey, sizeof key)) {
+            memcpy(f->eqKey, key, sizeof key);
+            for (int c = 0; c < 2; c++) {
+                wv_biquad_set(&f->eq[0][c], 0, 180, key[0], 0.7f);
+                wv_biquad_set(&f->eq[1][c], 1, key[2], key[1], 0.8f);
+                wv_biquad_set(&f->eq[2][c], 2, 4500, key[3], 0.7f);
+            }
+        }
+        for (int c = 0; c < 2; c++)
+            for (int t = 0; t < n; t++) ch[c][t] = bq(&f->eq[2][c], bq(&f->eq[1][c], bq(&f->eq[0][c], ch[c][t])));
+    }
+    if (q[WQ_SAT_ON] > 0.5f) {   // warm tanh saturation; BIAS adds even harmonics
+        float g = exp2f(q[WQ_SAT_DRIVE] * 4.5f), b = q[WQ_SAT_BIAS] * 0.5f, tb = tanhf(b), comp = 1 / sqrtf(g), mix = q[WQ_SAT_MIX];
+        float lc = 1 - expf(-TAU * 1500 * exp2f(q[WQ_SAT_TONE] * 3.7f) / SR);
+        for (int c = 0; c < 2; c++)
+            for (int t = 0; t < n; t++) {
+                float x = ch[c][t], y = (tanhf(g * x + b) - tb) * comp;
+                f->satLp[c] += (y - f->satLp[c]) * lc;
+                ch[c][t] = x + (f->satLp[c] - x) * mix;
+            }
+    }
+    if (q[WQ_DST_ON] > 0.5f) {   // clip, fold, bit/rate crush or fuzz, then a tone filter
+        int type = (int)q[WQ_DST_TYPE];
+        float dr = q[WQ_DST_DRIVE], g = exp2f(dr * 6), mix = q[WQ_DST_MIX];
+        float lc = 1 - expf(-TAU * 600 * exp2f(q[WQ_DST_TONE] * 5) / SR);
+        float lev = exp2f(12 - dr * 9.5f);
+        int hold = 1 + (int)(dr * dr * 24);
+        for (int t = 0; t < n; t++) {
+            bool take = type != 2 || ++f->holdN >= hold;
+            if (take) f->holdN = 0;
+            for (int c = 0; c < 2; c++) {
+                float x = ch[c][t], y, v = g * x;
+                switch (type) {
+                case 0:  y = clampf(v, -1, 1) * 0.5f; break;
+                case 1:  y = wv_fold(v) * 0.5f; break;
+                case 2:  if (take) f->hold[c] = roundf(x * lev) / lev; y = f->hold[c]; break;
+                default: y = (v > 0 ? 1 - expf(-v) : -(1 - expf(v * 0.7f)) * 0.85f) * 0.5f; break;
+                }
+                f->dstLp[c][0] += (y - f->dstLp[c][0]) * lc;
+                f->dstLp[c][1] += (f->dstLp[c][0] - f->dstLp[c][1]) * lc;
+                ch[c][t] = x + (f->dstLp[c][1] - x) * mix;
+            }
+        }
+    }
+    if (q[WQ_CMP_ON] > 0.5f) {   // stereo-linked peak compressor
+        float thr = q[WQ_CMP_THR], sl = 1 - 1 / q[WQ_CMP_RATIO], mk = q[WQ_CMP_GAIN];
+        float ca = 1 - expf(-1 / (q[WQ_CMP_ATK] * SR)), cr = 1 - expf(-1 / (q[WQ_CMP_REL] * SR));
+        for (int t = 0; t < n; t++) {
+            float lv = fmaxf(fabsf(L[t]), fabsf(R[t])), over = 20 * log10f(lv + 1e-9f) - thr;
+            float target = over > 0 ? over * sl : 0;
+            f->gr += (target - f->gr) * (target > f->gr ? ca : cr);
+            float gain = exp2f((mk - f->gr) * 0.16609640f);
+            L[t] *= gain; R[t] *= gain;
+        }
+    }
+    if (q[WQ_CHO_ON] > 0.5f) {   // three swept taps per side
+        float rate = q[WQ_CHO_RATE], dep = q[WQ_CHO_DEPTH], mix = q[WQ_CHO_MIX];
+        for (int t = 0; t < n; t++) {
+            f->choPh = fractf(f->choPh + rate / SR);
+            f->cw = (f->cw + 1) & (WV_CHO - 1);
+            for (int c = 0; c < 2; c++) {
+                float x = ch[c][t], wet = 0;
+                f->cho[c][f->cw] = x;
+                for (int v = 0; v < 3; v++) {
+                    float d = (0.010f + dep * 0.007f * (1 + sinf(TAU * (f->choPh + v / 3.0f + c / 6.0f)))) * SR;
+                    float rp = f->cw - d;
+                    if (rp < 0) rp += WV_CHO;
+                    int i0 = (int)rp;
+                    float fr = rp - i0;
+                    wet += f->cho[c][i0] + fr * (f->cho[c][(i0 + 1) & (WV_CHO - 1)] - f->cho[c][i0]);
+                }
+                ch[c][t] = x * (1 - mix * 0.5f) + wet / 3 * mix;
+            }
+        }
+    }
+    if (q[WQ_FLG_ON] > 0.5f) {   // short swept delay with feedback
+        float rate = q[WQ_FLG_RATE], dep = q[WQ_FLG_DEPTH], fb = q[WQ_FLG_FB], mix = q[WQ_FLG_MIX];
+        for (int t = 0; t < n; t++) {
+            f->flgPh = fractf(f->flgPh + rate / SR);
+            f->fw = (f->fw + 1) & (WV_FLG - 1);
+            for (int c = 0; c < 2; c++) {
+                float x = ch[c][t];
+                float d = (0.0006f + dep * 0.0055f * (0.5f + 0.5f * sinf(TAU * (f->flgPh + c * 0.25f)))) * SR;
+                float rp = f->fw - d;
+                if (rp < 0) rp += WV_FLG;
+                int i0 = (int)rp;
+                float fr = rp - i0, tap = f->flg[c][i0] + fr * (f->flg[c][(i0 + 1) & (WV_FLG - 1)] - f->flg[c][i0]);
+                f->flg[c][f->fw] = clampf(x + fb * tap, -2, 2);
+                ch[c][t] = x * (1 - 0.5f * mix) + tap * 0.5f * mix;
+            }
+        }
+    }
+    if (q[WQ_PHS_ON] > 0.5f) {   // six swept allpass stages
+        f->phsPh = fractf(f->phsPh + q[WQ_PHS_RATE] * n / SR);
+        float fb = q[WQ_PHS_FB], mix = q[WQ_PHS_MIX];
+        for (int c = 0; c < 2; c++) {
+            float lfo = 0.5f + 0.5f * sinf(TAU * (f->phsPh + c * 0.25f));
+            float tn = tanf(3.14159265f * fminf(180 * exp2f(q[WQ_PHS_DEPTH] * 4.5f * lfo), SR * 0.4f) / SR), a = (tn - 1) / (tn + 1);
+            for (int t = 0; t < n; t++) {
+                float x = ch[c][t], v = x + fb * f->phsFb[c];
+                for (int st = 0; st < 6; st++) { float y = a * v + f->apz[c][st]; f->apz[c][st] = v - a * y; v = y; }
+                f->phsFb[c] = v + 1e-18f;
+                ch[c][t] = x * (1 - 0.5f * mix) + v * 0.5f * mix;
+            }
+        }
+    }
+    if (q[WQ_DLY_ON] > 0.5f) {   // stereo delay, ping-pong, darkening repeats
+        float target = clampf(q[WQ_DLY_TIME] * SR, 16, WV_DLY - 4), fb = q[WQ_DLY_FB], p = q[WQ_DLY_PING], mix = q[WQ_DLY_MIX];
+        float lc = 1 - expf(-TAU * 800 * exp2f(q[WQ_DLY_TONE] * 4.4f) / SR);
+        for (int t = 0; t < n; t++) {
+            f->dt += (target - f->dt) * 0.0003f;
+            float rp = f->dw - f->dt;
+            if (rp < 0) rp += WV_DLY;
+            int i0 = (int)rp, i1 = (i0 + 1) & (WV_DLY - 1);
+            float fr = rp - i0;
+            float tl = f->dly[0][i0] + fr * (f->dly[0][i1] - f->dly[0][i0]);
+            float tr = f->dly[1][i0] + fr * (f->dly[1][i1] - f->dly[1][i0]);
+            f->dlp[0] += (tl - f->dlp[0]) * lc;
+            f->dlp[1] += (tr - f->dlp[1]) * lc;
+            float fl = f->dlp[0] * fb, fr2 = f->dlp[1] * fb, x = L[t], y = R[t], mono = (x + y) * 0.5f;
+            f->dly[0][f->dw] = clampf(x + p * (mono - x) + (1 - p) * fl + p * fr2, -4, 4) + 1e-18f;
+            f->dly[1][f->dw] = clampf(y * (1 - p) + (1 - p) * fr2 + p * fl, -4, 4) + 1e-18f;
+            f->dw = (f->dw + 1) & (WV_DLY - 1);
+            L[t] = x * (1 - 0.5f * mix) + tl * mix;
+            R[t] = y * (1 - 0.5f * mix) + tr * mix;
+        }
+    }
+    if (q[WQ_PLT_ON] > 0.5f) wv_plate(f, q, L, R);
+}
+
+// Render the next block: notes, unison voices and the effects.
+static void wv_render(Module *m)
+{
+    WavorSt *s = m->st;
+    const float *q = s->q;
+    float L[WV_BLOCK] = { 0 }, R[WV_BLOCK] = { 0 };
+    if (s->pending >= 0) { s->cur = s->pending; s->pending = -1; }
+    const float *tab = s->tab[s->cur];
+    s->cA = 1 / (q[WQ_A] * SR);
+    s->cD = 1 - expf(-4 / (q[WQ_D] * SR));
+    s->cR = 1 - expf(-6.9f / (q[WQ_R] * SR));
+    float env0 = s->envBuf[0];
+
+    // notes: P1 plays C3 when unpatched, P2..P4 only when patched
+    bool act[WV_NOTES];
+    int nact = 0;
+    float gc = q[WQ_GLIDE] < 0.001f ? 1 : 1 - expf(-WV_BLOCK / (q[WQ_GLIDE] * 0.3f * SR));
+    for (int j = 0; j < WV_NOTES; j++) {
+        act[j] = j == 0 || HAS(m, j);
+        if (!act[j]) { s->was[j] = false; continue; }
+        float t = HAS(m, j) ? IN(m, j) : -1.0f;
+        if (!s->was[j]) s->pitch[j] = t;
+        s->was[j] = true;
+        s->pitch[j] += (t - s->pitch[j]) * gc;
+        nact++;
+    }
+
+    // wavetable position: knob, envelope, internal LFO and the POS input
+    s->lph = fractf(s->lph + q[WQ_LFORATE] * WV_BLOCK / SR);
+    float pos = q[WQ_POS] + q[WQ_ENVPOS] * env0 + q[WQ_LFOPOS] * 0.5f * sinf(TAU * s->lph) + IN(m, 5);
+    s->dpos = clampf(pos, 0, 1);
+
+    // voices: placed across the stereo image, shaped by the curves; the
+    // entropizer gives each its own slowly wandering offsets
+    int n = clampi((int)q[WQ_VOICES], 1, WV_MAXV);
+    float er = q[WQ_ENTRATE] * WV_BLOCK / SR, eg = fminf(1, er * 3);
+    float vg[WV_MAXV][2], vdet[WV_MAXV], vag[WV_MAXV], vpos[WV_MAXV];
+    for (int i = 0; i < n; i++) {
+        float *e = s->ent[i], *et = s->entT[i];
+        for (int k = 0; k < 5; k++) {
+            if (frand() < er) et[k] = frand() * 2 - 1;
+            e[k] += (et[k] - e[k]) * eg;
+        }
+        float u = n > 1 ? i / (float)(n - 1) * 2 - 1 : 0, x0 = u * q[WQ_SPREAD];
+        float E = wv_curve(q, WC_ENT, x0), x = clampf(x0 + e[0] * E * 0.35f, -1, 1);
+        vdet[i] = u * wv_curve(q, WC_DET, x) * 0.5f + e[1] * E * 0.25f;   // semitones
+        vag[i]  = clampf(wv_curve(q, WC_AGG, x) + e[2] * E * 0.5f, 0, 1);
+        float lv = wv_curve(q, WC_LVL, x) * clampf(1 + e[3] * E * 0.6f, 0, 1.6f);
+        vpos[i] = clampf(pos + wv_curve(q, WC_POS, x) - 0.5f + e[4] * E * 0.25f, 0, 1);
+        float pa = (x + 1) * 0.78539816f;
+        vg[i][0] = cosf(pa) * lv; vg[i][1] = sinf(pa) * lv;
+        s->vx[i] = x; s->vl[i] = lv; s->va[i] = vag[i]; s->vp[i] = vpos[i];
+    }
+    s->vn = n; s->dnotes = nact;
+
+    // a note starting from silence restarts the phases (PHASE RND 0: all together)
+    if (s->trig) {
+        s->trig = false;
+        if (env0 < 0.02f)
+            for (int j = 0; j < WV_NOTES; j++)
+                for (int i = 0; i < WV_MAXV; i++) s->ph[j][i] = q[WQ_PHASE] * frand();
+    }
+
+    if (tab) {
+        float oct = roundf(q[WQ_OCT]);
+        for (int j = 0; j < WV_NOTES; j++) {
+            if (!act[j]) continue;
+            float f = 261.6256f * exp2f(s->pitch[j] + oct);
+            for (int i = 0; i < n; i++) {
+                float fi = f * exp2f(vdet[i] / 12);
+                if (fi > 20000 || fi < 1) continue;
+                int k = clampi((int)ceilf(log2f(fi * 512 / 19000)), 0, WV_LV - 1);
+                float fp = vpos[i] * (WV_F - 1);
+                int f0 = (int)fp < WV_F - 2 ? (int)fp : WV_F - 2;
+                float fr = fp - f0, ag = vag[i];
+                const float *base = tab + wv_loff[k];
+                float w[4] = { (1 - fr) * (1 - ag), fr * (1 - ag), (1 - fr) * ag, fr * ag };
+                int fo[4] = { f0, f0 + 1, f0, f0 + 1 }, va[4] = { 0, 0, 1, 1 };
+                WvTap tp[4];
+                int nt = 0;
+                for (int c = 0; c < 4; c++)
+                    if (w[c] > 1e-4f) { tp[nt].t = base + (size_t)(fo[c] * 2 + va[c]) * WV_T; tp[nt++].w = w[c]; }
+                wv_voice_run(tp, nt, wv_lsize[k], &s->ph[j][i], fi / SR, vg[i][0], vg[i][1], L, R);
+            }
+        }
+    }
+    float amp = q[WQ_LEVEL] * 1.9f / sqrtf((float)(n * (nact ? nact : 1)));
+    for (int t = 0; t < WV_BLOCK; t++) { float g = s->envBuf[t] * amp; L[t] *= g; R[t] *= g; }
+    wv_fx(m, L, R, env0);
+    for (int t = 0; t < WV_BLOCK; t++) {
+        s->outL[t] = isfinite(L[t]) ? L[t] : 0;
+        s->outR[t] = isfinite(R[t]) ? R[t] : 0;
+    }
+}
+
+static void wv_process(Module *m)
+{
+    WavorSt *s = m->st;
+    m->out[0] = s->outL[s->bi];
+    m->out[1] = s->outR[s->bi];
+    // ADSR on GATE; with GATE unpatched it holds, so the voices drone
+    bool gated = HAS(m, 4), on = gated ? IN(m, 4) > 0.5f : true;
+    if (on && !s->gate) { s->stage = 1; s->trig = true; }
+    if (!on && s->gate) s->stage = 3;
+    s->gate = on;
+    switch (s->stage) {
+    case 1: s->env += s->cA; if (s->env >= 1) { s->env = 1; s->stage = 2; } break;
+    case 2: s->env += (s->q[WQ_S] - s->env) * s->cD; break;
+    case 3: s->env -= s->env * s->cR; if (s->env < 1e-5f) { s->env = 0; s->stage = 0; } break;
+    }
+    s->envBuf[s->bi] = s->env;
+    if (++s->bi >= WV_BLOCK) { s->bi = 0; wv_render(m); }
+}
+
+static void wv_init(Module *m)
+{
+    wv_static_init();
+    WavorSt *s = calloc(1, sizeof(WavorSt));
+    m->st = s;
+    for (int i = 0; i < WQ_N; i++) s->q[i] = WVP[i].k.def;
+    s->tab[0] = calloc((size_t)WV_F * 2 * WV_T, sizeof(float));
+    s->tab[1] = calloc((size_t)WV_F * 2 * WV_T, sizeof(float));
+    s->pending = -1; s->pick = -1; s->lastKnob = -1; s->lastJ = -1;
+    s->fx.dt = s->q[WQ_DLY_TIME] * SR;
+    s->cA = 1 / (s->q[WQ_A] * SR);
+    for (int j = 0; j < WV_NOTES; j++) for (int i = 0; i < WV_MAXV; i++) s->ph[j][i] = frand();
+    for (int i = 0; i < WV_MAXV; i++) for (int k = 0; k < 5; k++) s->ent[i][k] = s->entT[i][k] = frand() * 2 - 1;
+    for (int j = 0; j < WV_UPTS; j++) s->user[j] = sinf(TAU * j / WV_UPTS);
+    s->part[0] = 1;
+    wv_work(m, 1e9);
+}
+
+static void wv_fini(Module *m)
+{
+    WavorSt *s = m->st;
+    if (!s) return;
+    free(s->tab[0]); free(s->tab[1]);
+    s->tab[0] = s->tab[1] = NULL;
+}
+
+// ---- layout (relative to the custom area) ---------------------------------
+
+static Rectangle wv_rc(Rectangle a, float x, float y, float w, float h) { return (Rectangle){ a.x + x, a.y + y, w, h }; }
+static Rectangle wv_env_box(Rectangle a)  { return wv_rc(a, 0, 0, 290, 138); }
+static Rectangle wv_mst_box(Rectangle a)  { return wv_rc(a, 300, 0, 300, 138); }
+static Rectangle wv_wt_box(Rectangle a)   { return wv_rc(a, 0, 148, 396, 330); }
+static Rectangle wv_mor_box(Rectangle a)  { return wv_rc(a, 406, 148, 194, 330); }
+static Rectangle wv_voi_box(Rectangle a)  { return wv_rc(a, 0, 488, 600, 216); }
+static Rectangle wv_fx_box(Rectangle a)   { return wv_rc(a, 620, 0, a.width - 620, WV_H); }
+static Rectangle wv_pick_box(Rectangle a) { return wv_rc(a, 0, 148, 600, 330); }
+static Rectangle wv_view(Rectangle a)     { Rectangle b = wv_wt_box(a); return (Rectangle){ b.x + 6, b.y + 26, b.width - 12, b.height - 32 }; }
+static Rectangle wv_wave_btn(Rectangle a) { Rectangle b = wv_wt_box(a); return (Rectangle){ b.x + 86, b.y + 4, 186, 18 }; }
+static Rectangle wv_draw_btn(Rectangle a) { Rectangle b = wv_wt_box(a); return (Rectangle){ b.x + 278, b.y + 4, 52, 18 }; }
+static Rectangle wv_tab_btn(Rectangle a, int i) { Rectangle v = wv_view(a); return (Rectangle){ v.x + v.width - 150 + i * 74, v.y + 4, 70, 16 }; }
+static Rectangle wv_slot(Rectangle a, int k)     { Rectangle b = wv_mor_box(a); return (Rectangle){ b.x + 6, b.y + 24 + k * 76, b.width - 12, 70 }; }
+static Rectangle wv_slot_btn(Rectangle a, int k) { Rectangle r = wv_slot(a, k); return (Rectangle){ r.x + 44, r.y + 8, r.width - 50, 20 }; }
+static Rectangle wv_chip(Rectangle a, int c)     { Rectangle b = wv_voi_box(a); return (Rectangle){ b.x + 70 + c * 104, b.y + 4, 98, 18 }; }
+static Rectangle wv_stage(Rectangle a)    { Rectangle b = wv_voi_box(a); return (Rectangle){ b.x + 6, b.y + 26, 466, b.height - 32 }; }
+static Rectangle wv_fx_row(Rectangle a, int r) { Rectangle b = wv_fx_box(a); return (Rectangle){ b.x + 6, b.y + 22 + r * 68, b.width - 12, 64 }; }
+
+// the curve plot inside the stage: x is the stereo position -1..1
+static float wv_stage_x(Rectangle st, float x) { return st.x + 18 + (x + 1) * 0.5f * (st.width - 36); }
+static float wv_stage_top(Rectangle st)  { return st.y + 18; }
+static float wv_stage_base(Rectangle st) { return st.y + st.height - 34; }
+
+typedef struct { int q; Vector2 c; } WvKnob;
+
+static int wv_knobs(const WavorSt *s, Rectangle a, WvKnob *k)
+{
+    int n = 0;
+    Rectangle e = wv_env_box(a), mb = wv_mst_box(a), vb = wv_voi_box(a);
+    for (int i = 0; i < 4; i++) k[n++] = (WvKnob){ WQ_A + i, { e.x + 8 + (e.width - 16) * (i + 0.5f) / 4, e.y + 106 } };
+    static const int MST[8] = { WQ_OCT, WQ_GLIDE, WQ_PHASE, WQ_LEVEL, WQ_POS, WQ_ENVPOS, WQ_LFORATE, WQ_LFOPOS };
+    for (int i = 0; i < 8; i++) k[n++] = (WvKnob){ MST[i], { mb.x + mb.width * ((i % 4) + 0.5f) / 4, mb.y + (i < 4 ? 44 : 102) } };
+    if (s->pick < 0)
+        for (int i = 0; i < WV_SLOTS; i++) { Rectangle r = wv_slot(a, i); k[n++] = (WvKnob){ WQ_M1A + 2 * i, { r.x + 22, r.y + 30 } }; }
+    static const int VOI[3] = { WQ_VOICES, WQ_SPREAD, WQ_ENTRATE };
+    for (int i = 0; i < 3; i++) k[n++] = (WvKnob){ VOI[i], { vb.x + vb.width - 64, vb.y + 50 + i * 58 } };
+    for (int r = 0; r < WV_NFX; r++) {
+        Rectangle row = wv_fx_row(a, r);
+        for (int i = 0; i < WV_FX[r].n; i++) k[n++] = (WvKnob){ WV_FX[r].k[i], { row.x + 166 + i * 76, row.y + 24 } };
+    }
+    return n;
+}
+
+static void wv_set_q(WavorSt *s, int i, float v)
+{
+    const KnobDef *kd = &WVP[i].k;
+    v = clampf(v, kd->min, kd->max);
+    s->q[i] = kd->kind == K_STEP ? roundf(v) : v;
+}
+
+// ---- drawing --------------------------------------------------------------
+
+static void wv_box(Rectangle r, const char *title)
+{
+    DrawRectangleRec(r, (Color){ 31, 33, 35, 255 });
+    DrawRectangleLinesEx(r, 1, PANEL_LO);
+    txt(title, r.x + 8, r.y + 8, 10, TEXT_DIM);
+}
+
+static void wv_button(Rectangle r, const char *label, Vector2 mp, bool on)
+{
+    bool h = CheckCollisionPointRec(mp, r);
+    DrawRectangleRec(r, on ? fade(ACCENT, 0.16f) : h ? PANEL_HI : PANEL);
+    DrawRectangleLinesEx(r, 1, on || h ? ACCENT_DIM : PANEL_HI);
+    txt_c(label, r.x + r.width / 2, r.y + r.height / 2 - 5, 10, on || h ? ACCENT : TEXT);
+}
+
+static void wv_draw_knob(const WavorSt *s, const WvKnob *k, Vector2 mp, bool dim)
+{
+    const KnobDef *kd = &WVP[k->q].k;
+    float v = s->q[k->q], t = clampf(knob_to_t(kd, v), 0, 1), a1 = 135 + 270 * t;
+    bool hover = CheckCollisionPointCircle(mp, k->c, 15);
+    bool active = s->drag == WD_KNOB && s->dragQ == k->q && IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+    Color arc = dim ? fade(ACCENT_DIM, 0.45f) : ACCENT_DIM;
+    DrawRing(k->c, 12, 14, 135, 405, 30, PANEL_LO);
+    if (kd->min < 0 && kd->max > 0) {
+        float az = 135 + 270 * knob_to_t(kd, 0);
+        DrawRing(k->c, 12, 14, fminf(az, a1), fmaxf(az, a1), 20, arc);
+    } else DrawRing(k->c, 12, 14, 135, a1, 30, arc);
+    DrawCircleV((Vector2){ k->c.x, k->c.y + 1.5f }, 10, (Color){ 0, 0, 0, 80 });
+    DrawCircleV(k->c, 10, (Color){ 30, 31, 33, 255 });
+    DrawCircleV(k->c, 8.5f, (Color){ 46, 48, 50, 255 });
+    float ar = a1 * DEG2RAD;
+    DrawLineEx((Vector2){ k->c.x + cosf(ar) * 3, k->c.y + sinf(ar) * 3 }, (Vector2){ k->c.x + cosf(ar) * 8.5f, k->c.y + sinf(ar) * 8.5f }, 2, dim ? TEXT_DIM : TEXT);
+    const char *label = kd->name;
+    if (k->q == WQ_VOICES) label = TextFormat("%d VOICE%s", (int)v, v > 1.5f ? "S" : "");
+    else if (k->q >= WQ_M1A && k->q <= WQ_M4A && (k->q - WQ_M1A) % 2 == 0) label = TextFormat("%.0f%%", v * 100);
+    else if (hover || active || kd->fmt == F_LABEL) label = knob_text(kd, v);
+    if (hover || active) DrawRing(k->c, 14.5f, 15.5f, 0, 360, 30, fade(ACCENT, 0.5f));
+    txt_c(label, k->c.x, k->c.y + 17, 10, hover || active ? ACCENT : dim ? fade(TEXT_DIM, 0.55f) : TEXT_DIM);
+}
+
+static void wv_draw_env(WavorSt *s, Rectangle e)
+{
+    const float *q = s->q;
+    Rectangle g = { e.x + 8, e.y + 24, e.width - 16, 58 };
+    DrawRectangleRec(g, INSET);
+    float wA = 0.1f + knob_to_t(&WVP[WQ_A].k, q[WQ_A]), wD = 0.1f + knob_to_t(&WVP[WQ_D].k, q[WQ_D]);
+    float wR = 0.1f + knob_to_t(&WVP[WQ_R].k, q[WQ_R]), wS = 0.45f, sc = (g.width - 12) / (wA + wD + wS + wR);
+    float x0 = g.x + 6, top = g.y + 6, bot = g.y + g.height - 4, hh = bot - top, S = q[WQ_S];
+    float x1 = x0 + wA * sc, x2 = x1 + wD * sc, x3 = x2 + wS * sc, x4 = x3 + wR * sc;
+    Vector2 pts[48];
+    int n = 0;
+    pts[n++] = (Vector2){ x0, bot };
+    pts[n++] = (Vector2){ x1, top };
+    for (int i = 1; i <= 16; i++) { float u = i / 16.0f; pts[n++] = (Vector2){ x1 + u * (x2 - x1), bot - hh * (S + (1 - S) * expf(-4 * u)) }; }
+    pts[n++] = (Vector2){ x3, bot - hh * S };
+    for (int i = 1; i <= 16; i++) { float u = i / 16.0f; pts[n++] = (Vector2){ x3 + u * (x4 - x3), bot - hh * S * expf(-5 * u) }; }
+    for (int i = 0; i + 1 < n; i++) {
+        DrawTriangle(pts[i], (Vector2){ pts[i].x, bot }, pts[i + 1], fade(ACCENT, 0.06f));
+        DrawTriangle(pts[i + 1], (Vector2){ pts[i].x, bot }, (Vector2){ pts[i + 1].x, bot }, fade(ACCENT, 0.06f));
+    }
+    for (int i = 0; i + 1 < n; i++) DrawLineEx(pts[i], pts[i + 1], 1.6f, ACCENT);
+    // where the envelope is now
+    float ex = s->stage == 1 ? x0 + s->env * (x1 - x0) : s->stage == 2 ? x2 + (x3 - x2) * 0.5f :
+               s->stage == 3 ? x3 + (x4 - x3) * clampf(1 - s->env / fmaxf(S, 0.001f), 0, 1) : x4;
+    Vector2 d = { ex, bot - hh * s->env };
+    DrawCircleV(d, 6, fade(PHOSPHOR, 0.18f));
+    DrawCircleV(d, 2.5f, PHOSPHOR);
+}
+
+static void wv_draw_view(WavorSt *s, Rectangle v, Vector2 mp)
+{
+    DrawRectangleRec(v, INSET);
+    if (!s->dispOk) { txt_c("BUILDING...", v.x + v.width / 2, v.y + v.height / 2, 10, TEXT_DIM); return; }
+    const float dx = 3.6f, dy = 3.4f;
+    float w = v.width - 24 - dx * (WV_F - 1), amp = (v.height - 34 - dy * (WV_F - 1)) * 0.5f;
+    Vector2 pts[WV_DISP];
+    for (int f = WV_F - 1; f >= 0; f--) {   // back to front
+        float ox = v.x + 12 + f * dx, oy = v.y + v.height - 16 - amp - f * dy, t = f / (float)(WV_F - 1);
+        for (int j = 0; j < WV_DISP; j++) pts[j] = (Vector2){ ox + j * w / (WV_DISP - 1), oy - s->disp[f][j] * amp * 0.92f };
+        Color c = { (unsigned char)(52 + t * 60), (unsigned char)(110 + t * 32), (unsigned char)(82 + t * 100), 255 };
+        DrawLineStrip(pts, WV_DISP, fade(c, 0.22f + 0.4f * (1 - t)));
+    }
+    // the frame being played (POSITION with its modulation), and each voice's own position
+    float fp = s->dpos * (WV_F - 1);
+    int f0 = (int)fp < WV_F - 2 ? (int)fp : WV_F - 2;
+    float fr = fp - f0, ox = v.x + 12 + fp * dx, oy = v.y + v.height - 16 - amp - fp * dy;
+    for (int j = 0; j < WV_DISP; j++) {
+        float y = s->disp[f0][j] + fr * (s->disp[f0 + 1][j] - s->disp[f0][j]);
+        pts[j] = (Vector2){ ox + j * w / (WV_DISP - 1), oy - y * amp * 0.92f };
+    }
+    for (int j = 0; j + 1 < WV_DISP; j++) DrawLineEx(pts[j], pts[j + 1], 5, fade(PHOSPHOR, 0.10f));
+    for (int j = 0; j + 1 < WV_DISP; j++) DrawLineEx(pts[j], pts[j + 1], 1.6f, PHOSPHOR);
+    for (int i = 0; i < s->vn; i++) {
+        float vp = s->vp[i] * (WV_F - 1);
+        DrawCircleV((Vector2){ v.x + 7 + vp * dx, v.y + v.height - 16 - vp * dy }, 1.6f, fade(CABLE_COLORS[WV_CURVE_COL[WC_POS]], 0.8f));
+    }
+    txt("WAVE", v.x + 8, v.y + v.height - 12, 10, fade(TEXT_DIM, 0.7f));
+    txt("FULLY MORPHED", v.x + v.width - 8 - txt_w("FULLY MORPHED", 10), v.y + 6, 10, fade(TEXT_DIM, 0.7f));
+    (void)mp;
+}
+
+static void wv_draw_editor(WavorSt *s, Rectangle a, Vector2 mp)
+{
+    Rectangle v = wv_view(a);
+    DrawRectangleRec(v, INSET);
+    for (int g = 1; g < 8; g++) DrawLineEx((Vector2){ v.x + g * v.width / 8, v.y }, (Vector2){ v.x + g * v.width / 8, v.y + v.height }, 1, fade(ACCENT_DIM, 0.18f));
+    wv_button(wv_tab_btn(a, 0), "SHAPE", mp, s->userMode == 0);
+    wv_button(wv_tab_btn(a, 1), "PARTIALS", mp, s->userMode == 1);
+    if (s->userMode == 0) {
+        float cy = v.y + v.height / 2, hh = v.height / 2 - 26;
+        DrawLineEx((Vector2){ v.x, cy }, (Vector2){ v.x + v.width, cy }, 1, fade(ACCENT_DIM, 0.4f));
+        Vector2 prev = { 0 };
+        for (int j = 0; j <= WV_UPTS; j++) {
+            Vector2 p = { v.x + j * v.width / WV_UPTS, cy - s->user[j % WV_UPTS] * hh };
+            if (j) { DrawLineEx(prev, p, 4, fade(PHOSPHOR, 0.10f)); DrawLineEx(prev, p, 1.6f, PHOSPHOR); }
+            prev = p;
+        }
+        txt("DRAG TO DRAW ONE CYCLE", v.x + 8, v.y + 8, 10, TEXT_DIM);
+    } else {
+        float bw = v.width / WV_HARM, bot = v.y + v.height - 16, hh = bot - (v.y + 28);
+        for (int h = 0; h < WV_HARM; h++) {
+            float bh = s->part[h] * hh;
+            DrawRectangleRec((Rectangle){ v.x + h * bw + 2, bot - bh, bw - 4, bh }, fade(ACCENT, 0.55f));
+            DrawRectangleRec((Rectangle){ v.x + h * bw + 2, bot - bh, bw - 4, 2 }, PHOSPHOR);
+            if (h % 4 == 0) txt(TextFormat("%d", h + 1), v.x + h * bw + 3, bot + 3, 10, fade(TEXT_DIM, 0.7f));
+        }
+        txt("DRAG TO SET PARTIALS 1-32", v.x + 8, v.y + 8, 10, TEXT_DIM);
+    }
+}
+
+static void wv_draw_stage(WavorSt *s, Rectangle st, Vector2 mp)
+{
+    const float *q = s->q;
+    DrawRectangleRec(st, INSET);
+    float top = wv_stage_top(st), base = wv_stage_base(st), hh = base - top;
+    Vector2 me = { st.x + st.width / 2, st.y + st.height - 13 };
+    DrawLineEx((Vector2){ me.x, top }, (Vector2){ me.x, base }, 1, fade(ACCENT_DIM, 0.25f));
+    txt("L", st.x + 6, base + 4, 10, TEXT_DIM);
+    txt("R", st.x + st.width - 12, base + 4, 10, TEXT_DIM);
+    // the voices, as bars where they sit in the stereo image, and their rays to the listener
+    int n = s->vn;
+    float bw = clampf((st.width - 36) / (n ? n : 1) * 0.55f, 2, 9);
+    for (int i = 0; i < n; i++) DrawLineEx(me, (Vector2){ wv_stage_x(st, s->vx[i]), base }, 1, fade(ACCENT_DIM, 0.22f));
+    for (int i = 0; i < n; i++) {
+        float x = wv_stage_x(st, s->vx[i]), h = clampf(s->vl[i], 0, 1) * hh, ag = s->va[i];
+        Color c0 = ACCENT, c1 = CABLE_COLORS[1];
+        Color c = { (unsigned char)(c0.r + (c1.r - c0.r) * ag), (unsigned char)(c0.g + (c1.g - c0.g) * ag), (unsigned char)(c0.b + (c1.b - c0.b) * ag), 255 };
+        DrawRectangleRec((Rectangle){ x - bw / 2, base - h, bw, h }, fade(c, 0.35f));
+        DrawRectangleRec((Rectangle){ x - bw / 2, base - h, bw, 2 }, c);
+    }
+    DrawCircleV(me, 11, fade(PHOSPHOR, 0.12f));
+    DrawCircleV(me, 5, PHOSPHOR);
+    DrawTriangle((Vector2){ me.x, me.y - 10 }, (Vector2){ me.x - 3, me.y - 5 }, (Vector2){ me.x + 3, me.y - 5 }, PHOSPHOR);
+    // the curves; the selected one has handles
+    for (int pass = 0; pass < 2; pass++)
+        for (int c = 0; c < WV_NCURVE; c++) {
+            bool sel = c == s->curve;
+            if (sel != (pass == 1)) continue;
+            Color col = CABLE_COLORS[WV_CURVE_COL[c]];
+            Vector2 prev = { 0 };
+            for (int i = 0; i <= 40; i++) {
+                float x = i / 20.0f - 1;
+                Vector2 p = { wv_stage_x(st, x), base - wv_curve(q, c, x) * hh };
+                if (i) DrawLineEx(prev, p, sel ? 2 : 1, fade(col, sel ? 1 : 0.35f));
+                prev = p;
+            }
+            if (sel)
+                for (int h = 0; h < 3; h++) {
+                    Vector2 p = { wv_stage_x(st, h - 1.0f), base - q[WQ_CURVE + c * 3 + h] * hh };
+                    bool hv = s->drag == WD_CURVE && s->dragH == h && IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+                    DrawCircleV(p, hv ? 6 : 4.5f, col);
+                    DrawCircleV(p, 2, INSET);
+                }
+        }
+    const float *h = q + WQ_CURVE + s->curve * 3;
+    txt(TextFormat("%s   L %.0f%%   C %.0f%%   R %.0f%%", WV_CURVES[s->curve], h[0] * 100, h[1] * 100, h[2] * 100), st.x + 8, st.y + 5, 10, CABLE_COLORS[WV_CURVE_COL[s->curve]]);
+    const char *info = TextFormat("%d x %d NOTE%s", n, s->dnotes, s->dnotes == 1 ? "" : "S");
+    txt(info, st.x + st.width - 8 - txt_w(info, 10), st.y + 5, 10, TEXT_DIM);
+    (void)mp;
+}
+
+// Picker: 8 x 8 cells; the morpher picker has one family per column.
+static Rectangle wv_pick_cell(Rectangle a, int pick, int i)
+{
+    Rectangle pb = wv_pick_box(a);
+    float gy = pb.y + 26 + (pick ? 14 : 0), cw = (pb.width - 12) / 8, ch = (pb.y + pb.height - 6 - gy) / 8;
+    int c = pick ? i / 8 : i % 8, r = pick ? i % 8 : i / 8;
+    return (Rectangle){ pb.x + 6 + c * cw, gy + r * ch, cw - 3, ch - 3 };
+}
+static Rectangle wv_pick_user(Rectangle a)  { Rectangle pb = wv_pick_box(a); return (Rectangle){ pb.x + pb.width - 150, pb.y + 4, 110, 18 }; }
+static Rectangle wv_pick_close(Rectangle a) { Rectangle pb = wv_pick_box(a); return (Rectangle){ pb.x + pb.width - 30, pb.y + 4, 24, 18 }; }
+
+static void wv_draw_picker(WavorSt *s, Rectangle a, Vector2 mp)
+{
+    Rectangle pb = wv_pick_box(a);
+    DrawRectangleRec((Rectangle){ pb.x + 5, pb.y + 6, pb.width, pb.height }, (Color){ 0, 0, 0, 110 });
+    DrawRectangleRec(pb, (Color){ 26, 28, 30, 255 });
+    DrawRectangleLinesEx(pb, 1, ACCENT_DIM);
+    bool wave = s->pick == 0;
+    int cur = wave ? (int)s->q[WQ_WAVE] : (int)s->q[WQ_M1T + 2 * (s->pick - 1)];
+    txt(wave ? "CHOOSE A WAVE" : TextFormat("CHOOSE MORPHER %d", s->pick), pb.x + 10, pb.y + 9, 10, TEXT);
+    if (wave) wv_button(wv_pick_user(a), "USER / DRAW", mp, cur == WV_USER);
+    wv_button(wv_pick_close(a), "X", mp, false);
+    if (!wave)
+        for (int c = 0; c < 8; c++) { Rectangle r = wv_pick_cell(a, 1, c * 8); txt(WV_MCAT[c], r.x + 2, r.y - 13, 10, TEXT_DIM); }
+    for (int i = 0; i < 64; i++) {
+        Rectangle r = wv_pick_cell(a, s->pick, i);
+        bool h = CheckCollisionPointRec(mp, r), on = i == cur;
+        DrawRectangleRec(r, on ? fade(ACCENT, 0.18f) : h ? PANEL_HI : (Color){ 36, 38, 40, 255 });
+        if (on || h) DrawRectangleLinesEx(r, 1, on ? ACCENT : ACCENT_DIM);
+        if (wave) {
+            Vector2 prev = { 0 };
+            for (int j = 0; j <= 48; j++) {
+                Vector2 p = { r.x + 4 + j * (r.width - 8) / 48, r.y + 11 - wv_thumb[i][j % 48] * 7 };
+                if (j) DrawLineEx(prev, p, 1, on ? PHOSPHOR : fade(ACCENT, 0.7f));
+                prev = p;
+            }
+            txt(WV_WAVES[i], r.x + 4, r.y + r.height - 12, 10, on || h ? ACCENT : TEXT);
+        } else
+            txt(WV_MORPHS[i], r.x + 5, r.y + r.height / 2 - 5, 10, on || h ? ACCENT : TEXT);
+    }
+}
+
+static void wv_draw(Module *m, Rectangle a)
+{
+    WavorSt *s = m->st;
+    const float *q = s->q;
+    Vector2 mp = GetMousePosition();
+    Vector2 kmp = s->pick >= 0 && CheckCollisionPointRec(mp, wv_pick_box(a)) ? (Vector2){ -1e4f, -1e4f } : mp;
+
+    // envelope and master
+    Rectangle e = wv_env_box(a), mb = wv_mst_box(a);
+    wv_box(e, "ENVELOPE");
+    wv_draw_env(s, e);
+    wv_box(mb, "MASTER");
+    DrawLineEx((Vector2){ mb.x + 10, mb.y + 78 }, (Vector2){ mb.x + mb.width - 10, mb.y + 78 }, 1, PANEL_LO);
+
+    // wavetable
+    Rectangle wb = wv_wt_box(a);
+    wv_box(wb, "WAVETABLE");
+    int wave = (int)q[WQ_WAVE];
+    const char *wl = wave == WV_USER ? (s->userMode ? "USER  PARTIALS" : "USER  SHAPE") : TextFormat("%02d  %s", wave + 1, WV_WAVES[wave]);
+    wv_button(wv_wave_btn(a), wl, kmp, false);
+    wv_button(wv_draw_btn(a), "DRAW", kmp, s->drawMode);
+    const char *pl = TextFormat("POS %.0f%%", s->dpos * 100);
+    txt(pl, wb.x + wb.width - 8 - txt_w(pl, 10), wb.y + 8, 10, ACCENT);
+    if (s->drawMode) wv_draw_editor(s, a, kmp);
+    else wv_draw_view(s, wv_view(a), kmp);
+
+    // morphers
+    Rectangle mo = wv_mor_box(a);
+    wv_box(mo, "MORPHERS");
+    for (int k = 0; k < WV_SLOTS; k++) {
+        Rectangle r = wv_slot(a, k), b = wv_slot_btn(a, k);
+        int t = clampi((int)q[WQ_M1T + 2 * k], 0, 63);
+        float am = q[WQ_M1A + 2 * k];
+        DrawRectangleRec(r, (Color){ 25, 27, 29, 255 });
+        wv_button(b, TextFormat("%d  %s", k + 1, WV_MORPHS[t]), kmp, false);
+        txt(WV_MCAT[t / 8], b.x + 2, b.y + 27, 10, fade(TEXT_DIM, 0.8f));
+        DrawRectangleRec((Rectangle){ b.x, b.y + 42, b.width, 3 }, PANEL_LO);
+        DrawRectangleRec((Rectangle){ b.x, b.y + 42, b.width * am, 3 }, am > 0 ? ACCENT : ACCENT_DIM);
+    }
+
+    // voices
+    Rectangle vb = wv_voi_box(a);
+    wv_box(vb, "VOICES");
+    for (int c = 0; c < WV_NCURVE; c++) {
+        Rectangle r = wv_chip(a, c);
+        Color col = CABLE_COLORS[WV_CURVE_COL[c]];
+        bool on = c == s->curve, h = CheckCollisionPointRec(kmp, r);
+        DrawRectangleRec(r, on ? fade(col, 0.22f) : h ? PANEL_HI : PANEL);
+        DrawRectangleLinesEx(r, 1, on ? col : fade(col, 0.45f));
+        txt_c(WV_CURVES[c], r.x + r.width / 2, r.y + 4, 10, on ? TEXT : fade(col, 0.9f));
+    }
+    wv_draw_stage(s, wv_stage(a), kmp);
+
+    // effects
+    Rectangle fb = wv_fx_box(a);
+    wv_box(fb, "FX CHAIN");
+    txt("CLICK A NAME TO SWITCH IT ON OR OFF", fb.x + fb.width - 8 - txt_w("CLICK A NAME TO SWITCH IT ON OR OFF", 10), fb.y + 8, 10, fade(TEXT_DIM, 0.55f));
+    for (int r = 0; r < WV_NFX; r++) {
+        Rectangle row = wv_fx_row(a, r);
+        bool on = q[WV_FX[r].on] > 0.5f, h = CheckCollisionPointRec(kmp, (Rectangle){ row.x, row.y, 130, row.height });
+        DrawRectangleRec(row, on ? (Color){ 35, 39, 39, 255 } : (Color){ 27, 28, 30, 255 });
+        if (r < WV_NFX - 1) DrawLineEx((Vector2){ row.x + 14, row.y + 24 }, (Vector2){ row.x + 14, row.y + 68 + 13 }, 1, PANEL_HI);
+        Vector2 led = { row.x + 14, row.y + 18 };
+        if (on) { DrawCircleV(led, 8, fade(ACCENT, 0.2f)); DrawCircleV(led, 4.5f, ACCENT); }
+        else { DrawCircleV(led, 4.5f, PANEL_LO); DrawRing(led, 4, 5, 0, 360, 16, h ? ACCENT_DIM : PANEL_HI); }
+        txt(WV_FX[r].name, row.x + 28, row.y + 13, 10, on ? TEXT : h ? ACCENT : TEXT_DIM);
+        txt(TextFormat("%02d", r + 1), row.x + 28, row.y + 30, 10, fade(TEXT_DIM, 0.45f));
+        if (r == 4) {   // compressor: gain reduction
+            Rectangle gm = { row.x + row.width - 18, row.y + 8, 6, row.height - 16 };
+            DrawRectangleRec(gm, INSET);
+            float g = on ? clampf(s->fx.gr / 24, 0, 1) : 0;
+            DrawRectangleRec((Rectangle){ gm.x, gm.y, gm.width, gm.height * g }, CABLE_COLORS[1]);
+            txt("GR", gm.x - 16, gm.y + gm.height - 10, 10, fade(TEXT_DIM, 0.6f));
+        }
+    }
+
+    WvKnob ks[80];
+    int nk = wv_knobs(s, a, ks);
+    for (int i = 0; i < nk; i++) {
+        bool dim = false;
+        for (int r = 0; r < WV_NFX; r++)
+            for (int j = 0; j < WV_FX[r].n; j++) if (WV_FX[r].k[j] == ks[i].q) dim = q[WV_FX[r].on] < 0.5f;
+        if (ks[i].q >= WQ_M1A && ks[i].q <= WQ_M4A) dim = q[ks[i].q] <= 0;
+        wv_draw_knob(s, &ks[i], kmp, dim);
+    }
+    if (s->pick >= 0) wv_draw_picker(s, a, mp);
+}
+
+// ---- interaction ----------------------------------------------------------
+
+static void wv_toggle_draw(WavorSt *s)
+{
+    if (s->drawMode) { s->drawMode = false; return; }
+    int w = (int)s->q[WQ_WAVE];
+    if (w != WV_USER) {   // start drawing from the wave on screen
+        static float tmp[WV_N];
+        wv_wave(w, tmp);
+        for (int j = 0; j < WV_UPTS; j++) s->user[j] = tmp[j * (WV_N / WV_UPTS)];
+        wv_partials_of(tmp, WV_N, s->part);
+        s->userMode = 0; s->userSet = true; s->q[WQ_WAVE] = WV_USER; s->userVer++;
+    }
+    s->drawMode = true;
+}
+
+static void wv_edit(WavorSt *s, Rectangle a, Vector2 mp)
+{
+    Rectangle v = wv_view(a);
+    float fx = clampf((mp.x - v.x) / v.width, 0, 0.9999f);
+    if (s->userMode == 0) {
+        float hh = v.height / 2 - 26, y = clampf((v.y + v.height / 2 - mp.y) / hh, -1, 1);
+        int j = (int)(fx * WV_UPTS);
+        int j0 = s->lastJ < 0 ? j : s->lastJ;
+        float y0 = s->lastJ < 0 ? y : s->lastV;
+        int step = j >= j0 ? 1 : -1;
+        for (int k = j0; ; k += step) {
+            s->user[k] = j == j0 ? y : y0 + (y - y0) * (k - j0) / (float)(j - j0);
+            if (k == j) break;
+        }
+        s->lastJ = j; s->lastV = y;
+    } else {
+        float bot = v.y + v.height - 16, y = clampf((bot - mp.y) / (bot - (v.y + 28)), 0, 1);
+        int h = (int)(fx * WV_HARM);
+        int h0 = s->lastJ < 0 ? h : s->lastJ;
+        float y0 = s->lastJ < 0 ? y : s->lastV;
+        int step = h >= h0 ? 1 : -1;
+        for (int k = h0; ; k += step) {
+            s->part[k] = h == h0 ? y : y0 + (y - y0) * (k - h0) / (float)(h - h0);
+            if (k == h) break;
+        }
+        s->lastJ = h; s->lastV = y;
+    }
+    s->userSet = true;
+    s->userVer++;
+}
+
+static void wv_set_curve(WavorSt *s, Rectangle a, Vector2 mp)
+{
+    Rectangle st = wv_stage(a);
+    float top = wv_stage_top(st), base = wv_stage_base(st);
+    wv_set_q(s, WQ_CURVE + s->curve * 3 + s->dragH, (base - mp.y) / (base - top));
+}
+
+static int wv_pick_hit(const WavorSt *s, Rectangle a, Vector2 mp)   // 0..63, 100 user, 101 close, -1
+{
+    if (CheckCollisionPointRec(mp, wv_pick_close(a))) return 101;
+    if (s->pick == 0 && CheckCollisionPointRec(mp, wv_pick_user(a))) return 100;
+    for (int i = 0; i < 64; i++) if (CheckCollisionPointRec(mp, wv_pick_cell(a, s->pick, i))) return i;
+    return -1;
+}
+
+static bool wv_press(Module *m, Vector2 mp, Rectangle a)
+{
+    WavorSt *s = m->st;
+    s->drag = WD_NONE;
+    if (s->pick >= 0) {
+        int hit = wv_pick_hit(s, a, mp);
+        if (hit >= 0 && hit < 64) {
+            if (s->pick == 0) { s->q[WQ_WAVE] = (float)hit; s->drawMode = false; }
+            else s->q[WQ_M1T + 2 * (s->pick - 1)] = (float)hit;
+            s->pick = -1;
+        } else if (hit == 100) {
+            s->pick = -1;
+            if (s->userSet) s->q[WQ_WAVE] = WV_USER;
+            else { s->drawMode = false; wv_toggle_draw(s); }
+        } else if (hit == 101 || !CheckCollisionPointRec(mp, wv_pick_box(a))) s->pick = -1;
+        return true;
+    }
+    WvKnob ks[80];
+    int nk = wv_knobs(s, a, ks);
+    for (int i = 0; i < nk; i++)
+        if (CheckCollisionPointCircle(mp, ks[i].c, 15)) {
+            double now = GetTime();
+            const KnobDef *kd = &WVP[ks[i].q].k;
+            if (s->lastKnob == ks[i].q && now - s->lastClick < 0.3) { s->q[ks[i].q] = kd->def; s->lastKnob = -1; return true; }
+            s->drag = WD_KNOB; s->dragQ = ks[i].q; s->dragT = knob_to_t(kd, s->q[ks[i].q]); s->lastY = mp.y;
+            s->lastKnob = ks[i].q; s->lastClick = now;
+            return true;
+        }
+    if (CheckCollisionPointRec(mp, wv_wave_btn(a))) { s->pick = 0; return true; }
+    if (CheckCollisionPointRec(mp, wv_draw_btn(a))) { wv_toggle_draw(s); return true; }
+    for (int k = 0; k < WV_SLOTS; k++) if (CheckCollisionPointRec(mp, wv_slot_btn(a, k))) { s->pick = 1 + k; return true; }
+    for (int r = 0; r < WV_NFX; r++) {
+        Rectangle row = wv_fx_row(a, r);
+        if (CheckCollisionPointRec(mp, (Rectangle){ row.x, row.y, 130, row.height })) { s->q[WV_FX[r].on] = s->q[WV_FX[r].on] > 0.5f ? 0 : 1; return true; }
+    }
+    for (int c = 0; c < WV_NCURVE; c++) if (CheckCollisionPointRec(mp, wv_chip(a, c))) { s->curve = c; return true; }
+    Rectangle st = wv_stage(a);
+    if (CheckCollisionPointRec(mp, st)) {   // grab the nearest handle of the selected curve
+        float x = (mp.x - wv_stage_x(st, -1)) / (wv_stage_x(st, 1) - wv_stage_x(st, -1));
+        s->dragH = x < 1 / 3.0f ? 0 : x < 2 / 3.0f ? 1 : 2;
+        s->drag = WD_CURVE;
+        wv_set_curve(s, a, mp);
+        return true;
+    }
+    if (s->drawMode) {
+        for (int i = 0; i < 2; i++) if (CheckCollisionPointRec(mp, wv_tab_btn(a, i))) { s->userMode = i; s->userVer++; return true; }
+        if (CheckCollisionPointRec(mp, wv_view(a))) { s->drag = WD_EDIT; s->lastJ = -1; wv_edit(s, a, mp); return true; }
+    }
+    return false;
+}
+
+static void wv_drag(Module *m, Vector2 mp, Rectangle a)
+{
+    WavorSt *s = m->st;
+    bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    switch (s->drag) {
+    case WD_KNOB: {
+        const KnobDef *kd = &WVP[s->dragQ].k;
+        float range = kd->kind == K_STEP ? fmaxf(200.0f, (kd->max - kd->min) * 6.0f) : 200.0f;
+        s->dragT = clampf(s->dragT - (mp.y - s->lastY) / range * (shift ? 0.1f : 1.0f), 0, 1);
+        s->lastY = mp.y;
+        wv_set_q(s, s->dragQ, knob_from_t(kd, s->dragT));
+    } break;
+    case WD_CURVE: wv_set_curve(s, a, mp); break;
+    case WD_EDIT:  wv_edit(s, a, mp); break;
+    }
+}
+
+static bool wv_wheel(Module *m, Vector2 mp, Rectangle a, float w)
+{
+    WavorSt *s = m->st;
+    bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    int d = w > 0 ? 1 : -1;
+    if (s->pick >= 0) return CheckCollisionPointRec(mp, wv_pick_box(a));
+    WvKnob ks[80];
+    int nk = wv_knobs(s, a, ks);
+    for (int i = 0; i < nk; i++)
+        if (CheckCollisionPointCircle(mp, ks[i].c, 15)) {
+            const KnobDef *kd = &WVP[ks[i].q].k;
+            if (kd->kind == K_STEP) wv_set_q(s, ks[i].q, s->q[ks[i].q] + d);
+            else wv_set_q(s, ks[i].q, knob_from_t(kd, knob_to_t(kd, s->q[ks[i].q]) + w * (shift ? 0.005f : 0.03f)));
+            return true;
+        }
+    if (CheckCollisionPointRec(mp, wv_wave_btn(a))) {   // step through the waves
+        int wv = (int)s->q[WQ_WAVE];
+        s->q[WQ_WAVE] = (float)(wv == WV_USER ? (d > 0 ? 0 : WV_NWAVE - 1) : (wv + d + WV_NWAVE) % WV_NWAVE);
+        s->drawMode = false;
+        return true;
+    }
+    for (int k = 0; k < WV_SLOTS; k++)
+        if (CheckCollisionPointRec(mp, wv_slot_btn(a, k))) { s->q[WQ_M1T + 2 * k] = (float)(((int)s->q[WQ_M1T + 2 * k] + d + 64) % 64); return true; }
+    Rectangle st = wv_stage(a);
+    if (CheckCollisionPointRec(mp, st)) {
+        float x = (mp.x - wv_stage_x(st, -1)) / (wv_stage_x(st, 1) - wv_stage_x(st, -1));
+        int h = x < 1 / 3.0f ? 0 : x < 2 / 3.0f ? 1 : 2, qi = WQ_CURVE + s->curve * 3 + h;
+        wv_set_q(s, qi, s->q[qi] + w * (shift ? 0.005f : 0.03f));
+        return true;
+    }
+    return false;
+}
+
+static bool wv_rpress(Module *m, Vector2 mp, Rectangle a)   // right-click: bypass a morpher, reset a curve
+{
+    WavorSt *s = m->st;
+    if (s->pick >= 0) { s->pick = -1; return true; }
+    for (int k = 0; k < WV_SLOTS; k++) if (CheckCollisionPointRec(mp, wv_slot_btn(a, k))) { s->q[WQ_M1A + 2 * k] = 0; return true; }
+    if (CheckCollisionPointRec(mp, wv_stage(a))) {
+        for (int h = 0; h < 3; h++) s->q[WQ_CURVE + s->curve * 3 + h] = WVP[WQ_CURVE + s->curve * 3 + h].k.def;
+        return true;
+    }
+    return false;
+}
+
+// ---- presets and sampling --------------------------------------------------
+
+static void wv_save(const Module *m, char *out, int cap)
+{
+    const WavorSt *s = m->st;
+    int n = 0;
+#define WV_PUT(...) do { if (n < cap) n += snprintf(out + n, cap - n, __VA_ARGS__); } while (0)
+    for (int i = 0; i < WQ_N; i++) if (WVP[i].key) WV_PUT("%s=%.5g ", WVP[i].key, s->q[i]);
+    WV_PUT("um=%d us=%d u=", s->userMode, s->userSet ? 1 : 0);
+    for (int j = 0; j < WV_UPTS; j++) WV_PUT("%02x", (int)roundf(clampf(s->user[j], -1, 1) * 127.5f + 127.5f));
+    WV_PUT(" h=");
+    for (int j = 0; j < WV_HARM; j++) WV_PUT("%02x", (int)roundf(clampf(s->part[j], 0, 1) * 255));
+#undef WV_PUT
+}
+
+static void wv_load(Module *m, const char *str)
+{
+    WavorSt *s = m->st;
+    char tok[640];
+    for (const char *p = str; *p; ) {
+        while (*p == ' ') p++;
+        int len = (int)strcspn(p, " ");
+        if (!len) break;
+        if (len < (int)sizeof tok) {
+            memcpy(tok, p, len);
+            tok[len] = 0;
+            char *eq = strchr(tok, '=');
+            if (eq) {
+                *eq = 0;
+                const char *k = tok, *v = eq + 1;
+                unsigned b;
+                if (!strcmp(k, "u")) { for (int j = 0; j < WV_UPTS && v[2 * j] && v[2 * j + 1] && sscanf(v + 2 * j, "%2x", &b) == 1; j++) s->user[j] = (b - 127.5f) / 127.5f; }
+                else if (!strcmp(k, "h")) { for (int j = 0; j < WV_HARM && v[2 * j] && v[2 * j + 1] && sscanf(v + 2 * j, "%2x", &b) == 1; j++) s->part[j] = b / 255.0f; }
+                else if (!strcmp(k, "um")) s->userMode = atoi(v) ? 1 : 0;
+                else if (!strcmp(k, "us")) s->userSet = atoi(v) != 0;
+                else for (int i = 0; i < WQ_N; i++) if (WVP[i].key && !strcmp(k, WVP[i].key)) { wv_set_q(s, i, (float)atof(v)); break; }
+            }
+        }
+        p += len;
+    }
+    s->userVer++;
+    s->fx.dt = s->q[WQ_DLY_TIME] * SR;
+    wv_work(m, 1e9);
+}
+
+// Drop an audio file on WAVOR: find the pitch where it is loudest and take
+// one cycle of it as the user shape.
+static void wv_load_audio(Module *m, const char *path)
+{
+    WavorSt *s = m->st;
+    Wave w = LoadWave(path);
+    if (!w.data || w.frameCount < 64) { if (w.data) UnloadWave(w); toast(TextFormat("CANNOT READ %s", GetFileName(path))); return; }
+    WaveFormat(&w, (int)SR, 32, 1);
+    const float *x = w.data;
+    int n = (int)w.frameCount < 60 * (int)SR ? (int)w.frameCount : 60 * (int)SR;
+    enum { WIN = 2048, MINLAG = 24, MAXLAG = 1200 };
+    int st = 0;
+    float best = -1, period = 0;
+    for (int i = 0; i + WIN + MAXLAG < n; i += WIN / 2) {
+        float e = 0;
+        for (int k = 0; k < WIN; k++) e += x[i + k] * x[i + k];
+        if (e > best) { best = e; st = i; }
+    }
+    if (n > WIN + MAXLAG) {   // normalised autocorrelation; the shortest strong peak avoids octave errors
+        static float r[MAXLAG + 1];
+        float rmax = 0;
+        for (int l = MINLAG; l <= MAXLAG; l++) {
+            double xy = 0, xx = 0, yy = 0;
+            for (int k = 0; k < WIN; k++) { double p = x[st + k], q = x[st + k + l]; xy += p * q; xx += p * p; yy += q * q; }
+            r[l] = xx > 0 && yy > 0 ? (float)(xy / sqrt(xx * yy)) : 0;
+            rmax = fmaxf(rmax, r[l]);
+        }
+        if (rmax > 0.5f)
+            for (int l = MINLAG + 1; l < MAXLAG; l++)
+                if (r[l] >= 0.9f * rmax && r[l] >= r[l - 1] && r[l] >= r[l + 1]) {
+                    float d = r[l - 1] - 2 * r[l] + r[l + 1];
+                    period = l + (fabsf(d) > 1e-9f ? 0.5f * (r[l - 1] - r[l + 1]) / d : 0);
+                    break;
+                }
+    }
+    int z = st;
+    for (int k = 0; k < WIN && st + k + 1 < n; k++) if (x[st + k] <= 0 && x[st + k + 1] > 0) { z = st + k; break; }
+    float len = period > 0 ? period : fminf(WIN, (float)(n - z - 2));
+    for (int j = 0; j < WV_UPTS; j++) {
+        float p = z + j * len / WV_UPTS;
+        int i0 = clampi((int)p, 0, n - 2);
+        s->user[j] = x[i0] + (p - i0) * (x[i0 + 1] - x[i0]);
+    }
+    UnloadWave(w);
+    float mean = 0, pk = 0;
+    for (int j = 0; j < WV_UPTS; j++) mean += s->user[j] / WV_UPTS;
+    for (int j = 0; j < WV_UPTS; j++) { s->user[j] -= mean; pk = fmaxf(pk, fabsf(s->user[j])); }
+    for (int j = 0; j < WV_UPTS; j++) s->user[j] = pk > 1e-6f ? s->user[j] / pk : 0;
+    wv_partials_of(s->user, WV_UPTS, s->part);
+    s->userMode = 0; s->userSet = true; s->q[WQ_WAVE] = WV_USER; s->userVer++;
+    if (period > 0) toast(TextFormat("WAVOR: ONE CYCLE OF %s (%.1f HZ)", GetFileName(path), SR / period));
+    else toast(TextFormat("WAVOR: NO CLEAR PITCH IN %s, TOOK A SLICE", GetFileName(path)));
+}
+
+// ---------------------------------------------------------------------------
 // Module registry
 // ---------------------------------------------------------------------------
 
@@ -3109,6 +4859,10 @@ static const ModDef DEFS[M_COUNT] = {
         .knobs = { { "GLIDE", 0, 30, 4, K_KNOB, F_SEC } },
         .init = arr_init, .process = arr_process, .draw = arr_draw, .press = arr_press, .drag = arr_drag,
         .save = arr_save, .load = arr_load, .wheel = arr_wheel, .rpress = arr_rpress },
+    [M_WAVOR] = { .name = "WAVOR", .w = WV_W, .customH = WV_H, .nin = 7, .nout = 2, .nknob = 0,
+        .ins = { "P1", "P2", "P3", "P4", "GATE", "POS", "CUTOFF" }, .outs = { "L", "R" },
+        .init = wv_init, .process = wv_process, .draw = wv_draw, .press = wv_press, .drag = wv_drag,
+        .save = wv_save, .load = wv_load, .fini = wv_fini, .wheel = wv_wheel, .rpress = wv_rpress },
 };
 
 // Stable ids used in preset files.
@@ -3116,7 +4870,7 @@ static const char *MOD_ID[M_COUNT] = {
     [M_CLOCK] = "clock", [M_SEQ] = "seq", [M_CHORD] = "chords", [M_OSC3] = "osc3",
     [M_LFO] = "lfo", [M_REVERB] = "reverb", [M_OUT] = "output", [M_TAPE] = "tape",
     [M_ARP] = "arp", [M_PERF] = "performer", [M_DRUMS] = "drums", [M_SAMPLER] = "sampler",
-    [M_FILTER] = "filter", [M_CHORUS] = "chorus", [M_ARR] = "arranger",
+    [M_FILTER] = "filter", [M_CHORUS] = "chorus", [M_ARR] = "arranger", [M_WAVOR] = "wavor",
 };
 
 // ---------------------------------------------------------------------------
@@ -3274,6 +5028,8 @@ static const char *knob_text(const KnobDef *k, float v)
     case F_PCT:  return TextFormat("%.0f%%", knob_to_t(k, v) * 100);
     case F_PROG: return TextFormat("#%02d", (int)roundf(v) + 1);
     case F_LABEL: return k->labels[clampi((int)roundf(v - k->min), 0, (int)(k->max - k->min))];
+    case F_DB:    return TextFormat("%+.1f DB", v);
+    case F_RATIO: return TextFormat("%.1f:1", v);
     default:     return TextFormat("%.2f", v);
     }
 }
@@ -3491,7 +5247,8 @@ static char *patch_serialize(const char *name, bool project)
             bput(&b, "knob %s %.6g\n", key, m->p[k]);
         }
         if (d->save) {
-            char data[512] = { 0 };
+            static char data[4096];
+            data[0] = 0;
             d->save(m, data, sizeof data);
             bput(&b, "data %s\n", data);
         }
@@ -3526,7 +5283,7 @@ static int preset_instantiate(const char *text, Vector2 at, bool keepIds)
 {
     int map[MAX_MODULES], n = 0, added = 0;
     Module *cur = NULL;
-    char line[1024];
+    static char line[8192];
     select_none();
     for (const char *p = text; *p; ) {
         p = next_line(p, line, sizeof line);
@@ -3913,6 +5670,32 @@ static const struct { const char *name, *body; } FACTORY[] = {
       "cable 10 1 18 1 1\n"
       "cable 11 0 18 0 3\n"
       "cable 11 1 18 1 3\n" },
+    { "wavor chords",
+      "module clock 0 0\n"
+      "knob BPM 60\n"
+      "module chords 252 0\n"
+      "knob PROG 5\nknob CHORD_LEN 3\n"
+      "module wavor 0 200\n"
+      "module output 1240 200\n"
+      "cable 0 2 1 0 0\n"
+      "cable 1 0 2 0 1\ncable 1 1 2 1 1\ncable 1 2 2 2 1\ncable 1 3 2 3 1\n"
+      "cable 2 0 3 0 4\ncable 2 1 3 1 4\n" },
+    { "wavor glass arp",
+      "module clock 0 0\n"
+      "knob BPM 84\n"
+      "module chords 252 0\n"
+      "knob PROG 12\nknob CHORD_LEN 3\n"
+      "module arp 644 0\n"
+      "knob MODE 2\nknob OCTAVES 2\nknob GATE 0.4\n"
+      "module wavor 0 220\n"
+      "data wave=33 m1=43 m1a=0.5 m2=16 m2a=0.35 m3a=0 m4a=0 a=0.004 d=0.7 s=0.12 r=1.4 "
+      "pos=0.1 envpos=0.45 lfopos=0.1 voices=6 spread=1 cdetl=0.3 cdetc=0.1 cdetr=0.3 "
+      "fltcut=2600 fltenv=0.6 fltres=0.3 dlytime=0.536 dlyfb=0.5 dlymix=0.35 pltmix=0.4 pltdecay=0.8\n"
+      "module output 1240 220\n"
+      "cable 0 2 1 0 0\ncable 0 0 2 4 2\n"
+      "cable 1 0 2 0 1\ncable 1 1 2 1 1\ncable 1 2 2 2 1\ncable 1 3 2 3 1\n"
+      "cable 2 0 3 0 3\ncable 2 1 3 4 3\n"
+      "cable 3 0 4 0 4\ncable 3 1 4 1 4\n" },
 };
 #define N_FACTORY ((int)(sizeof FACTORY / sizeof FACTORY[0]))
 
@@ -4390,7 +6173,7 @@ static struct {
     double  videoT;
 } ui = { .lastKnobMod = -1, .toastT = -10 };
 
-static const int MENU_ORDER[M_COUNT] = { M_CLOCK, M_ARR, M_LFO, M_SEQ, M_CHORD, M_ARP, M_PERF, M_OSC3, M_DRUMS, M_SAMPLER, M_TAPE, M_FILTER, M_CHORUS, M_REVERB, M_OUT };
+static const int MENU_ORDER[M_COUNT] = { M_CLOCK, M_ARR, M_LFO, M_SEQ, M_CHORD, M_ARP, M_PERF, M_OSC3, M_WAVOR, M_DRUMS, M_SAMPLER, M_TAPE, M_FILTER, M_CHORUS, M_REVERB, M_OUT };
 #define MENU_W 160
 #define MENU_ITEM_H 24
 #define MENU_N (M_COUNT + 1)   // modules + "PRESET RACK..."
@@ -5144,13 +6927,14 @@ static void handle_audio_files(Vector2 mp)
 #endif
     FilePathList dropped = LoadDroppedFiles();
     int target = module_at(mp);
-    if (target >= 0 && mods[target].type != M_TAPE && mods[target].type != M_SAMPLER) target = -1;
+    if (target >= 0 && mods[target].type != M_TAPE && mods[target].type != M_SAMPLER && mods[target].type != M_WAVOR) target = -1;
     for (unsigned int i = 0; i < dropped.count; i++) {
         int t = target;
         if (t < 0 || i > 0)   // dropped on empty space: a new tape for each file
             t = add_module(M_TAPE, mp.x - pan.x + i * 24, mp.y - pan.y + i * 24);
         if (t < 0) continue;
-        if (mods[t].type == M_SAMPLER) sampler_load(&mods[t], dropped.paths[i]);
+        if (mods[t].type == M_WAVOR) wv_load_audio(&mods[t], dropped.paths[i]);
+        else if (mods[t].type == M_SAMPLER) sampler_load(&mods[t], dropped.paths[i]);
         else tape_load(&mods[t], dropped.paths[i]);
     }
     UnloadDroppedFiles(dropped);
@@ -5178,6 +6962,8 @@ static void frame(void)
             for (int k = 0; k < N_KITS; k++) if (!kits[k].ready) { kit_work(k, 0.003); break; }
             break;
         }
+    for (int i = 0; i < MAX_MODULES; i++)   // build changed wavetables a little each frame
+        if (mods[i].alive && mods[i].type == M_WAVOR) wv_work(&mods[i], 0.004);
     handle_audio_files(GetMousePosition());
     handle_input();
     if (ui.recOn && !g_recording) {   // stopped by hand or full: offer to save it
@@ -5235,7 +7021,7 @@ static void frame(void)
     draw_minimap(ui.modal || ui.menu ? (Vector2){ -1, -1 } : mp);
     int ns = selection_count();
     if (ns) draw_button(btn_save(), TextFormat("SAVE %d MODULE%s AS PRESET", ns, ns == 1 ? "" : "S"), bmp, true);
-    txt("SPACE: RUN/STOP   R: REC AUDIO   V: REC VIDEO   O: PROJECTS   P: PRESETS   S: SAVE SELECTION   DRAG JACK TO JACK: PATCH   RIGHT-CLICK JACK: UNPLUG   RIGHT-CLICK SPACE: ADD   SHIFT-DRAG: SELECT   DROP AUDIO FILE: TAPE",
+    txt("SPACE: RUN/STOP   R: REC AUDIO   V: REC VIDEO   O: PROJECTS   P: PRESETS   S: SAVE SELECTION   DRAG JACK TO JACK: PATCH   RIGHT-CLICK JACK: UNPLUG   RIGHT-CLICK SPACE: ADD   SHIFT-DRAG: SELECT   DROP AUDIO FILE: TAPE (ON WAVOR: A CYCLE)",
         18, GetScreenHeight() - 22, 10, fade(TEXT_DIM, 0.8f));
 
     if (ui.menu) {
