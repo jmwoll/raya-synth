@@ -109,7 +109,7 @@ static const char *NOTE_NAMES[12] = { "C","C#","D","D#","E","F","F#","G","G#","A
 // ---------------------------------------------------------------------------
 
 enum { K_KNOB, K_EXP, K_STEP, K_SEG };
-enum { F_NUM, F_INT, F_HZ, F_SEC, F_BPM, F_SEMI, F_PCT, F_PROG, F_OCT, F_LABEL, F_DB, F_RATIO };
+enum { F_NUM, F_INT, F_HZ, F_SEC, F_BPM, F_SEMI, F_PCT, F_PROG, F_OCT, F_LABEL, F_DB, F_RATIO, F_OCTS, F_SEMIS };
 
 typedef struct {
     const char  *name;
@@ -2856,8 +2856,10 @@ static void chorus_process(Module *m)
             float d = (0.010f + m->p[1] * 0.007f * (1 + sinf(TAU * (s->ph + v / 3.0f + c / 6.0f)))) * SR;
             float rp = s->w - d;
             if (rp < 0) rp += CH_LEN;
-            int i0 = (int)rp, i1 = (i0 + 1) & (CH_LEN - 1);
+            int i0 = (int)rp;
             float fr = rp - i0;
+            i0 &= CH_LEN - 1;
+            int i1 = (i0 + 1) & (CH_LEN - 1);
             wet += s->buf[c][i0] * (1 - fr) + s->buf[c][i1] * fr;
         }
         m->out[c] = in[c] * (1 - m->p[2] * 0.5f) + wet / 3 * m->p[2];
@@ -3065,12 +3067,16 @@ static void arr_load(Module *m, const char *str)
 #define WV_CHO    4096
 #define WV_FLG    2048
 #define WV_W      1220                 // module width
-#define WV_H      704                  // custom area height
+#define WV_H      878                  // custom area height
+#define WV_BAR    36                   // the preset bar above the panes
 
 static float knob_to_t(const KnobDef *k, float v);
+typedef struct WavorSt WavorSt;
+static unsigned wv_sound_sig(const WavorSt *s);
 static float knob_from_t(const KnobDef *k, float t);
 static const char *knob_text(const KnobDef *k, float v);
 
+static int   g_kbd_owner = -1;   // module typing text: keyboard shortcuts are off
 static float wv_cs[WV_HALF], wv_sn[WV_HALF];
 static int   wv_lsize[WV_LV], wv_loff[WV_LV];
 static float wv_thumb[WV_NWAVE][48];
@@ -3124,6 +3130,8 @@ enum {
     WQ_PHS_ON, WQ_PHS_RATE, WQ_PHS_DEPTH, WQ_PHS_FB, WQ_PHS_MIX,
     WQ_DLY_ON, WQ_DLY_TIME, WQ_DLY_FB, WQ_DLY_PING, WQ_DLY_TONE, WQ_DLY_MIX,
     WQ_PLT_ON, WQ_PLT_PRE, WQ_PLT_DECAY, WQ_PLT_DAMP, WQ_PLT_MIX,
+    WQ_FLT_KEY, WQ_MA, WQ_MD, WQ_MCUT, WQ_MPOS, WQ_MPITCH, WQ_TREM,
+    WQ_VIBRATE, WQ_VIBDEPTH, WQ_VIBDELAY, WQ_NOISE, WQ_NTONE, WQ_NDECAY,
     WQ_N
 };
 
@@ -3219,12 +3227,25 @@ static const WvParam WVP[WQ_N] = {
     [WQ_PLT_DECAY] = { "pltdecay", { "DECAY", 0.05f, 0.97f, 0.7f, K_KNOB, F_PCT } },
     [WQ_PLT_DAMP]  = { "pltdamp",  { "DAMP", 0, 1, 0.35f, K_KNOB, F_PCT } },
     [WQ_PLT_MIX]   = { "pltmix",   { "MIX", 0, 1, 0.35f, K_KNOB, F_PCT } },
+    [WQ_FLT_KEY]   = { "fltkey",   { "KEYTRACK", 0, 1, 0, K_KNOB, F_PCT } },
+    [WQ_MA]        = { "ma",       { "M ATTACK", 0.001f, 5, 0.001f, K_EXP, F_SEC } },
+    [WQ_MD]        = { "md",       { "M DECAY", 0.01f, 10, 0.5f, K_EXP, F_SEC } },
+    [WQ_MCUT]      = { "mcut",     { ">CUTOFF", -8, 8, 0, K_KNOB, F_OCTS } },
+    [WQ_MPOS]      = { "mpos",     { ">POSITION", -1, 1, 0, K_KNOB, F_NUM } },
+    [WQ_MPITCH]    = { "mpitch",   { ">PITCH", -24, 24, 0, K_KNOB, F_SEMIS } },
+    [WQ_TREM]      = { "trem",     { "TREMOLO", 0, 1, 0, K_KNOB, F_PCT } },
+    [WQ_VIBRATE]   = { "vibrate",  { "VIB RATE", 0.5f, 12, 5.5f, K_EXP, F_HZ } },
+    [WQ_VIBDEPTH]  = { "vibdepth", { "VIB DEPTH", 0, 1, 0, K_KNOB, F_SEMIS } },
+    [WQ_VIBDELAY]  = { "vibdelay", { "VIB DELAY", 0, 4, 0, K_KNOB, F_SEC } },
+    [WQ_NOISE]     = { "noise",    { "NOISE", 0, 1, 0, K_KNOB, F_PCT } },
+    [WQ_NTONE]     = { "ntone",    { "N TONE", 0.5f, 32, 4, K_EXP, F_NUM } },
+    [WQ_NDECAY]    = { "ndecay",   { "N DECAY", 0, 3, 0, K_KNOB, F_SEC } },
 };
 
 typedef struct { const char *name; int on, n, k[5]; } WvFx;
 #define WV_NFX 10
 static const WvFx WV_FX[WV_NFX] = {
-    { "FILTER",       WQ_FLT_ON, 4, { WQ_FLT_MODE, WQ_FLT_CUT, WQ_FLT_RES, WQ_FLT_ENV } },
+    { "FILTER",       WQ_FLT_ON, 5, { WQ_FLT_MODE, WQ_FLT_CUT, WQ_FLT_RES, WQ_FLT_ENV, WQ_FLT_KEY } },
     { "EQ",           WQ_EQ_ON,  4, { WQ_EQ_LOW, WQ_EQ_MID, WQ_EQ_FREQ, WQ_EQ_HIGH } },
     { "SATURATION",   WQ_SAT_ON, 4, { WQ_SAT_DRIVE, WQ_SAT_BIAS, WQ_SAT_TONE, WQ_SAT_MIX } },
     { "DISTORTION",   WQ_DST_ON, 4, { WQ_DST_TYPE, WQ_DST_DRIVE, WQ_DST_TONE, WQ_DST_MIX } },
@@ -3259,7 +3280,7 @@ typedef struct {   // what a table build is made from, copied when it starts
 
 enum { WD_NONE, WD_KNOB, WD_CURVE, WD_EDIT };
 
-typedef struct {
+struct WavorSt {
     float q[WQ_N];
     // wavetable: built by the UI into tab[1 - cur], taken by the audio via pending
     float *tab[2];
@@ -3282,13 +3303,16 @@ typedef struct {
     float lph;
     float vx[WV_MAXV], vl[WV_MAXV], va[WV_MAXV], vp[WV_MAXV]; int vn, dnotes; float dpos;   // for the UI
     WvFxSt fx;
+    float menv, tOn, vph, nenv, nic1, nic2; int mstage;   // mod envelope, vibrato, noise
+    int   pidx; char pname[33]; unsigned psig;              // preset: 0..127 factory, 128..255 user, -1 none
+    bool  browse, saveMode; int browseTab, naming, armDel; char nameBuf[33];
     // UI
     int   pick;            // -1, 0 = wave picker, 1..4 = morpher picker for that slot
     bool  drawMode;
     int   curve, drag, dragQ, dragH, lastKnob, lastJ;
     float dragT, lastY, lastV;
     double lastClick;
-} WavorSt;
+};
 
 // ---- tables: FFT, waves, morphers ----------------------------------------
 
@@ -3855,7 +3879,8 @@ static void wv_fx(Module *m, float *L, float *R, float env)
     const int n = WV_BLOCK;
 
     if (q[WQ_FLT_ON] > 0.5f) {   // state-variable filter, cutoff follows the envelope and CUTOFF
-        float fc = clampf(q[WQ_FLT_CUT] * exp2f(q[WQ_FLT_ENV] * env * 5 + IN(m, 6) * 5), 20, SR * 0.45f);
+        float key = q[WQ_FLT_KEY] * (s->pitch[0] + roundf(q[WQ_OCT]));
+        float fc = clampf(q[WQ_FLT_CUT] * exp2f(q[WQ_FLT_ENV] * env * 5 + q[WQ_MCUT] * s->menv + key + IN(m, 6) * 5), 20, SR * 0.45f);
         float g = tanf(3.14159265f * fc / SR), k = 2 - 1.95f * q[WQ_FLT_RES];
         float a1 = 1 / (1 + g * (g + k)), a2 = g * a1, a3 = g * a2;
         int mode = (int)q[WQ_FLT_MODE];
@@ -3938,6 +3963,7 @@ static void wv_fx(Module *m, float *L, float *R, float env)
                     if (rp < 0) rp += WV_CHO;
                     int i0 = (int)rp;
                     float fr = rp - i0;
+                    i0 &= WV_CHO - 1;
                     wet += f->cho[c][i0] + fr * (f->cho[c][(i0 + 1) & (WV_CHO - 1)] - f->cho[c][i0]);
                 }
                 ch[c][t] = x * (1 - mix * 0.5f) + wet / 3 * mix;
@@ -3955,7 +3981,9 @@ static void wv_fx(Module *m, float *L, float *R, float env)
                 float rp = f->fw - d;
                 if (rp < 0) rp += WV_FLG;
                 int i0 = (int)rp;
-                float fr = rp - i0, tap = f->flg[c][i0] + fr * (f->flg[c][(i0 + 1) & (WV_FLG - 1)] - f->flg[c][i0]);
+                float fr = rp - i0;
+                i0 &= WV_FLG - 1;
+                float tap = f->flg[c][i0] + fr * (f->flg[c][(i0 + 1) & (WV_FLG - 1)] - f->flg[c][i0]);
                 f->flg[c][f->fw] = clampf(x + fb * tap, -2, 2);
                 ch[c][t] = x * (1 - 0.5f * mix) + tap * 0.5f * mix;
             }
@@ -3982,8 +4010,10 @@ static void wv_fx(Module *m, float *L, float *R, float env)
             f->dt += (target - f->dt) * 0.0003f;
             float rp = f->dw - f->dt;
             if (rp < 0) rp += WV_DLY;
-            int i0 = (int)rp, i1 = (i0 + 1) & (WV_DLY - 1);
+            int i0 = (int)rp;
             float fr = rp - i0;
+            i0 &= WV_DLY - 1;
+            int i1 = (i0 + 1) & (WV_DLY - 1);
             float tl = f->dly[0][i0] + fr * (f->dly[0][i1] - f->dly[0][i0]);
             float tr = f->dly[1][i0] + fr * (f->dly[1][i1] - f->dly[1][i0]);
             f->dlp[0] += (tl - f->dlp[0]) * lc;
@@ -4010,7 +4040,20 @@ static void wv_render(Module *m)
     s->cA = 1 / (q[WQ_A] * SR);
     s->cD = 1 - expf(-4 / (q[WQ_D] * SR));
     s->cR = 1 - expf(-6.9f / (q[WQ_R] * SR));
-    float env0 = s->envBuf[0];
+    float env0 = s->envBuf[0], dtb = WV_BLOCK / SR;
+    bool trig = s->trig;
+    s->trig = false;
+
+    // mod envelope (attack, decay to zero), vibrato with its delay, noise burst
+    if (trig) { s->mstage = 1; s->tOn = 0; s->nenv = 1; if (q[WQ_MA] <= 0.0015f) { s->menv = 1; s->mstage = 2; } }
+    s->tOn += dtb;
+    if (s->mstage == 1) { s->menv += dtb / q[WQ_MA]; if (s->menv >= 1) { s->menv = 1; s->mstage = 2; } }
+    else if (s->mstage == 2) s->menv *= expf(-4.6f * dtb / q[WQ_MD]);
+    s->nenv = q[WQ_NDECAY] > 0 ? s->nenv * expf(-4.6f * dtb / q[WQ_NDECAY]) : 1;
+    s->vph = fractf(s->vph + q[WQ_VIBRATE] * dtb);
+    float vfade = q[WQ_VIBDELAY] > 0 ? clampf(s->tOn / q[WQ_VIBDELAY], 0, 1) : 1;
+    float pmod = (q[WQ_VIBDEPTH] * vfade * vfade * sinf(TAU * s->vph) + q[WQ_MPITCH] * s->menv) / 12;
+    float trem = 1 - q[WQ_TREM] * vfade * (0.5f - 0.5f * cosf(TAU * s->vph));
 
     // notes: P1 plays C3 when unpatched, P2..P4 only when patched
     bool act[WV_NOTES];
@@ -4028,7 +4071,7 @@ static void wv_render(Module *m)
 
     // wavetable position: knob, envelope, internal LFO and the POS input
     s->lph = fractf(s->lph + q[WQ_LFORATE] * WV_BLOCK / SR);
-    float pos = q[WQ_POS] + q[WQ_ENVPOS] * env0 + q[WQ_LFOPOS] * 0.5f * sinf(TAU * s->lph) + IN(m, 5);
+    float pos = q[WQ_POS] + q[WQ_ENVPOS] * env0 + q[WQ_LFOPOS] * 0.5f * sinf(TAU * s->lph) + q[WQ_MPOS] * s->menv + IN(m, 5);
     s->dpos = clampf(pos, 0, 1);
 
     // voices: placed across the stereo image, shaped by the curves; the
@@ -4055,8 +4098,7 @@ static void wv_render(Module *m)
     s->vn = n; s->dnotes = nact;
 
     // a note starting from silence restarts the phases (PHASE RND 0: all together)
-    if (s->trig) {
-        s->trig = false;
+    if (trig) {
         if (env0 < 0.02f)
             for (int j = 0; j < WV_NOTES; j++)
                 for (int i = 0; i < WV_MAXV; i++) s->ph[j][i] = q[WQ_PHASE] * frand();
@@ -4066,7 +4108,7 @@ static void wv_render(Module *m)
         float oct = roundf(q[WQ_OCT]);
         for (int j = 0; j < WV_NOTES; j++) {
             if (!act[j]) continue;
-            float f = 261.6256f * exp2f(s->pitch[j] + oct);
+            float f = 261.6256f * exp2f(s->pitch[j] + oct + pmod);
             for (int i = 0; i < n; i++) {
                 float fi = f * exp2f(vdet[i] / 12);
                 if (fi > 20000 || fi < 1) continue;
@@ -4086,6 +4128,19 @@ static void wv_render(Module *m)
         }
     }
     float amp = q[WQ_LEVEL] * 1.9f / sqrtf((float)(n * (nact ? nact : 1)));
+    if (q[WQ_NOISE] > 0) {   // breath, bow or pick noise: band-pass around a multiple of the pitch
+        float f0 = 261.6256f * exp2f(s->pitch[0] + roundf(q[WQ_OCT]) + pmod);
+        float fc = clampf(f0 * q[WQ_NTONE], 60, 16000), g = tanf(3.14159265f * fc / SR), k = 0.7f;
+        float a1 = 1 / (1 + g * (g + k)), a2 = g * a1, a3 = g * a2;
+        float lvl = q[WQ_NOISE] * s->nenv * 1.2f * sqrtf((float)(n * (nact ? nact : 1))) * sqrtf(SR * 0.5f / fc);
+        for (int t = 0; t < WV_BLOCK; t++) {
+            float x = frand() * 2 - 1, v3 = x - s->nic2;
+            float v1 = a1 * s->nic1 + a2 * v3, v2 = s->nic2 + a2 * s->nic1 + a3 * v3;
+            s->nic1 = 2 * v1 - s->nic1; s->nic2 = 2 * v2 - s->nic2;
+            L[t] += k * v1 * lvl; R[t] += k * v1 * lvl;
+        }
+    }
+    amp *= trem;
     for (int t = 0; t < WV_BLOCK; t++) { float g = s->envBuf[t] * amp; L[t] *= g; R[t] *= g; }
     wv_fx(m, L, R, env0);
     for (int t = 0; t < WV_BLOCK; t++) {
@@ -4121,7 +4176,7 @@ static void wv_init(Module *m)
     for (int i = 0; i < WQ_N; i++) s->q[i] = WVP[i].k.def;
     s->tab[0] = calloc((size_t)WV_F * 2 * WV_T, sizeof(float));
     s->tab[1] = calloc((size_t)WV_F * 2 * WV_T, sizeof(float));
-    s->pending = -1; s->pick = -1; s->lastKnob = -1; s->lastJ = -1;
+    s->pending = -1; s->pick = -1; s->lastKnob = -1; s->lastJ = -1; s->pidx = -1; s->naming = -1; s->armDel = -1;
     s->fx.dt = s->q[WQ_DLY_TIME] * SR;
     s->cA = 1 / (s->q[WQ_A] * SR);
     for (int j = 0; j < WV_NOTES; j++) for (int i = 0; i < WV_MAXV; i++) s->ph[j][i] = frand();
@@ -4129,12 +4184,14 @@ static void wv_init(Module *m)
     for (int j = 0; j < WV_UPTS; j++) s->user[j] = sinf(TAU * j / WV_UPTS);
     s->part[0] = 1;
     wv_work(m, 1e9);
+    s->psig = wv_sound_sig(s);
 }
 
 static void wv_fini(Module *m)
 {
     WavorSt *s = m->st;
     if (!s) return;
+    if (g_kbd_owner == (int)(m - mods)) g_kbd_owner = -1;
     free(s->tab[0]); free(s->tab[1]);
     s->tab[0] = s->tab[1] = NULL;
 }
@@ -4147,7 +4204,8 @@ static Rectangle wv_mst_box(Rectangle a)  { return wv_rc(a, 300, 0, 300, 138); }
 static Rectangle wv_wt_box(Rectangle a)   { return wv_rc(a, 0, 148, 396, 330); }
 static Rectangle wv_mor_box(Rectangle a)  { return wv_rc(a, 406, 148, 194, 330); }
 static Rectangle wv_voi_box(Rectangle a)  { return wv_rc(a, 0, 488, 600, 216); }
-static Rectangle wv_fx_box(Rectangle a)   { return wv_rc(a, 620, 0, a.width - 620, WV_H); }
+static Rectangle wv_fx_box(Rectangle a)   { return wv_rc(a, 620, 0, a.width - 620, a.height); }
+static Rectangle wv_mod_box(Rectangle a)  { return wv_rc(a, 0, 714, 600, a.height - 714); }
 static Rectangle wv_pick_box(Rectangle a) { return wv_rc(a, 0, 148, 600, 330); }
 static Rectangle wv_view(Rectangle a)     { Rectangle b = wv_wt_box(a); return (Rectangle){ b.x + 6, b.y + 26, b.width - 12, b.height - 32 }; }
 static Rectangle wv_wave_btn(Rectangle a) { Rectangle b = wv_wt_box(a); return (Rectangle){ b.x + 86, b.y + 4, 186, 18 }; }
@@ -4157,7 +4215,8 @@ static Rectangle wv_slot(Rectangle a, int k)     { Rectangle b = wv_mor_box(a); 
 static Rectangle wv_slot_btn(Rectangle a, int k) { Rectangle r = wv_slot(a, k); return (Rectangle){ r.x + 44, r.y + 8, r.width - 50, 20 }; }
 static Rectangle wv_chip(Rectangle a, int c)     { Rectangle b = wv_voi_box(a); return (Rectangle){ b.x + 70 + c * 104, b.y + 4, 98, 18 }; }
 static Rectangle wv_stage(Rectangle a)    { Rectangle b = wv_voi_box(a); return (Rectangle){ b.x + 6, b.y + 26, 466, b.height - 32 }; }
-static Rectangle wv_fx_row(Rectangle a, int r) { Rectangle b = wv_fx_box(a); return (Rectangle){ b.x + 6, b.y + 22 + r * 68, b.width - 12, 64 }; }
+static float wv_fx_h(Rectangle a) { return (wv_fx_box(a).height - 26) / WV_NFX; }
+static Rectangle wv_fx_row(Rectangle a, int r) { Rectangle b = wv_fx_box(a); float h = wv_fx_h(a); return (Rectangle){ b.x + 6, b.y + 22 + r * h, b.width - 12, h - 4 }; }
 
 // the curve plot inside the stage: x is the stereo position -1..1
 static float wv_stage_x(Rectangle st, float x) { return st.x + 18 + (x + 1) * 0.5f * (st.width - 36); }
@@ -4179,8 +4238,11 @@ static int wv_knobs(const WavorSt *s, Rectangle a, WvKnob *k)
     for (int i = 0; i < 3; i++) k[n++] = (WvKnob){ VOI[i], { vb.x + vb.width - 64, vb.y + 50 + i * 58 } };
     for (int r = 0; r < WV_NFX; r++) {
         Rectangle row = wv_fx_row(a, r);
-        for (int i = 0; i < WV_FX[r].n; i++) k[n++] = (WvKnob){ WV_FX[r].k[i], { row.x + 166 + i * 76, row.y + 24 } };
+        for (int i = 0; i < WV_FX[r].n; i++) k[n++] = (WvKnob){ WV_FX[r].k[i], { row.x + 166 + i * 76, row.y + row.height / 2 - 6 } };
     }
+    static const int MOD[12] = { WQ_MA, WQ_MD, WQ_MCUT, WQ_MPOS, WQ_MPITCH, WQ_TREM, WQ_VIBRATE, WQ_VIBDEPTH, WQ_VIBDELAY, WQ_NOISE, WQ_NTONE, WQ_NDECAY };
+    Rectangle md = wv_mod_box(a);
+    for (int i = 0; i < 12; i++) k[n++] = (WvKnob){ MOD[i], { md.x + md.width * ((i % 6) + 0.5f) / 6, md.y + (i < 6 ? 42 : 94) } };
     return n;
 }
 
@@ -4416,7 +4478,7 @@ static void wv_draw_picker(WavorSt *s, Rectangle a, Vector2 mp)
     }
 }
 
-static void wv_draw(Module *m, Rectangle a)
+static void wv_draw_body(Module *m, Rectangle a)
 {
     WavorSt *s = m->st;
     const float *q = s->q;
@@ -4477,7 +4539,7 @@ static void wv_draw(Module *m, Rectangle a)
         Rectangle row = wv_fx_row(a, r);
         bool on = q[WV_FX[r].on] > 0.5f, h = CheckCollisionPointRec(kmp, (Rectangle){ row.x, row.y, 130, row.height });
         DrawRectangleRec(row, on ? (Color){ 35, 39, 39, 255 } : (Color){ 27, 28, 30, 255 });
-        if (r < WV_NFX - 1) DrawLineEx((Vector2){ row.x + 14, row.y + 24 }, (Vector2){ row.x + 14, row.y + 68 + 13 }, 1, PANEL_HI);
+        if (r < WV_NFX - 1) DrawLineEx((Vector2){ row.x + 14, row.y + 24 }, (Vector2){ row.x + 14, row.y + wv_fx_h(a) + 13 }, 1, PANEL_HI);
         Vector2 led = { row.x + 14, row.y + 18 };
         if (on) { DrawCircleV(led, 8, fade(ACCENT, 0.2f)); DrawCircleV(led, 4.5f, ACCENT); }
         else { DrawCircleV(led, 4.5f, PANEL_LO); DrawRing(led, 4, 5, 0, 360, 16, h ? ACCENT_DIM : PANEL_HI); }
@@ -4492,6 +4554,9 @@ static void wv_draw(Module *m, Rectangle a)
         }
     }
 
+    Rectangle mdb = wv_mod_box(a);
+    wv_box(mdb, "MODULATION");
+    txt("MOD ENVELOPE, TREMOLO, VIBRATO, NOISE", mdb.x + mdb.width - 8 - txt_w("MOD ENVELOPE, TREMOLO, VIBRATO, NOISE", 10), mdb.y + 8, 10, fade(TEXT_DIM, 0.55f));
     WvKnob ks[80];
     int nk = wv_knobs(s, a, ks);
     for (int i = 0; i < nk; i++) {
@@ -4566,7 +4631,7 @@ static int wv_pick_hit(const WavorSt *s, Rectangle a, Vector2 mp)   // 0..63, 10
     return -1;
 }
 
-static bool wv_press(Module *m, Vector2 mp, Rectangle a)
+static bool wv_press_body(Module *m, Vector2 mp, Rectangle a)
 {
     WavorSt *s = m->st;
     s->drag = WD_NONE;
@@ -4634,7 +4699,7 @@ static void wv_drag(Module *m, Vector2 mp, Rectangle a)
     }
 }
 
-static bool wv_wheel(Module *m, Vector2 mp, Rectangle a, float w)
+static bool wv_wheel_body(Module *m, Vector2 mp, Rectangle a, float w)
 {
     WavorSt *s = m->st;
     bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
@@ -4667,7 +4732,7 @@ static bool wv_wheel(Module *m, Vector2 mp, Rectangle a, float w)
     return false;
 }
 
-static bool wv_rpress(Module *m, Vector2 mp, Rectangle a)   // right-click: bypass a morpher, reset a curve
+static bool wv_rpress_body(Module *m, Vector2 mp, Rectangle a)   // right-click: bypass a morpher, reset a curve
 {
     WavorSt *s = m->st;
     if (s->pick >= 0) { s->pick = -1; return true; }
@@ -4691,12 +4756,15 @@ static void wv_save(const Module *m, char *out, int cap)
     for (int j = 0; j < WV_UPTS; j++) WV_PUT("%02x", (int)roundf(clampf(s->user[j], -1, 1) * 127.5f + 127.5f));
     WV_PUT(" h=");
     for (int j = 0; j < WV_HARM; j++) WV_PUT("%02x", (int)roundf(clampf(s->part[j], 0, 1) * 255));
+    char pn[sizeof s->pname];
+    snprintf(pn, sizeof pn, "%s", s->pname[0] ? s->pname : "INIT");
+    for (char *c = pn; *c; c++) if (*c == ' ') *c = '_';
+    WV_PUT(" pi=%d pn=%s", s->pidx, pn);
 #undef WV_PUT
 }
 
-static void wv_load(Module *m, const char *str)
+static void wv_parse(WavorSt *s, const char *str)
 {
-    WavorSt *s = m->st;
     char tok[640];
     for (const char *p = str; *p; ) {
         while (*p == ' ') p++;
@@ -4714,6 +4782,8 @@ static void wv_load(Module *m, const char *str)
                 else if (!strcmp(k, "h")) { for (int j = 0; j < WV_HARM && v[2 * j] && v[2 * j + 1] && sscanf(v + 2 * j, "%2x", &b) == 1; j++) s->part[j] = b / 255.0f; }
                 else if (!strcmp(k, "um")) s->userMode = atoi(v) ? 1 : 0;
                 else if (!strcmp(k, "us")) s->userSet = atoi(v) != 0;
+                else if (!strcmp(k, "pi")) s->pidx = atoi(v);
+                else if (!strcmp(k, "pn")) { snprintf(s->pname, sizeof s->pname, "%s", v); for (char *c = s->pname; *c; c++) if (*c == '_') *c = ' '; }
                 else for (int i = 0; i < WQ_N; i++) if (WVP[i].key && !strcmp(k, WVP[i].key)) { wv_set_q(s, i, (float)atof(v)); break; }
             }
         }
@@ -4721,6 +4791,13 @@ static void wv_load(Module *m, const char *str)
     }
     s->userVer++;
     s->fx.dt = s->q[WQ_DLY_TIME] * SR;
+}
+
+static void wv_load(Module *m, const char *str)   // a project or preset rack line
+{
+    WavorSt *s = m->st;
+    wv_parse(s, str);
+    s->psig = wv_sound_sig(s);
     wv_work(m, 1e9);
 }
 
@@ -4776,6 +4853,447 @@ static void wv_load_audio(Module *m, const char *path)
     s->userMode = 0; s->userSet = true; s->q[WQ_WAVE] = WV_USER; s->userVer++;
     if (period > 0) toast(TextFormat("WAVOR: ONE CYCLE OF %s (%.1f HZ)", GetFileName(path), SR / period));
     else toast(TextFormat("WAVOR: NO CLEAR PITCH IN %s, TOOK A SLICE", GetFileName(path)));
+}
+
+
+// ---- presets ----------------------------------------------------------------
+// 128 factory presets (8 groups of 16) and 128 user slots. A preset is a
+// list of key=value tokens applied on top of WV_INIT; user slots hold a full
+// copy of the sound and live in their own files, shared by all projects.
+
+#define WV_NPRESET 128
+#define WV_GROUPS  8
+static const char *WV_GROUP[WV_GROUPS] = { "PLUCK", "SYNTH", "BASS", "PAD", "WIND", "STRING", "KEYS", "MALLET" };
+
+// A plain, dry, single-voice saw: every preset starts from this.
+static const char *WV_INIT =
+    "wave=4 m1a=0 m2a=0 m3a=0 m4a=0 pos=0 envpos=0 lfopos=0 lforate=0.1 a=0.003 d=1 s=1 r=0.3 glide=0 phase=0 "
+    "level=0.7 oct=0 voices=1 spread=0 entrate=0.15 cdetl=0 cdetc=0 cdetr=0 caggl=0 caggc=0 caggr=0 centl=0 centc=0 centr=0 "
+    "cposl=0.5 cposc=0.5 cposr=0.5 clvll=1 clvlc=1 clvlr=1 flt=0 fltmode=0 fltcut=18000 fltres=0 fltenv=0 fltkey=0 "
+    "eq=0 eqlow=0 eqmid=0 eqfreq=1000 eqhigh=0 sat=0 dst=0 cmp=0 cho=0 flg=0 phs=0 dly=0 plt=0 "
+    "ma=0.001 md=0.5 mcut=0 mpos=0 mpitch=0 trem=0 vibrate=5.5 vibdepth=0 vibdelay=0 noise=0 ntone=4 ndecay=0";
+
+typedef struct { const char *name, *data; } WvPreset;
+// WV_FACTORY_BEGIN (generated from the preset list with its reference checks)
+static const WvPreset WV_FACTORY[WV_NPRESET] = {
+    { "DIGI PLUCK", "wave=4 a=0.001 d=0.4 s=0 r=0.25 flt=1 fltcut=500 fltres=0.25 fltkey=1 mcut=4.5 md=0.22 voices=2 spread=0.5 cdetl=0.08 cdetr=0.08 phase=1 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.573" },
+    { "HOUSE PLUCK", "wave=63 a=0.001 d=0.3 s=0 r=0.2 flt=1 fltcut=700 fltres=0.35 fltkey=1 mcut=4 md=0.15 cho=1 chomix=0.3 dly=1 dlytime=0.375 dlyfb=0.25 dlymix=0.15 level=0.715" },
+    { "TRANCE PLUCK", "wave=4 voices=7 spread=1 cdetl=0.5 cdetc=0.2 cdetr=0.5 phase=1 a=0.001 d=0.5 s=0 r=0.3 flt=1 fltcut=600 fltkey=1 fltres=0.2 mcut=4.5 md=0.3 plt=1 pltmix=0.2 level=0.555" },
+    { "FUTURE PLUCK", "wave=4 m1=8 m1a=0.7 pos=0 mpos=1 md=0.15 a=0.001 d=0.35 s=0 r=0.25 flt=1 fltcut=900 fltkey=1 mcut=3 voices=3 spread=0.6 cdetl=0.15 cdetr=0.15 phase=1 cho=1 chomix=0.25 level=0.635" },
+    { "SQUARE PLUCK", "wave=2 a=0.001 d=0.3 s=0 r=0.2 flt=1 fltcut=500 fltkey=1 fltres=0.3 mcut=4 md=0.18 level=0.581" },
+    { "CHIP PLUCK", "wave=3 a=0.001 d=0.25 s=0 r=0.1 dly=1 dlytime=0.2 dlyfb=0.2 dlymix=0.12 level=0.661" },
+    { "SOFT PLUCK", "wave=1 a=0.002 d=0.6 s=0 r=0.3 flt=1 fltcut=800 fltkey=1 mcut=2 md=0.3 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.652" },
+    { "FM PLUCK", "wave=0 m1=17 m1a=0.9 pos=0 mpos=1 md=0.12 a=0.001 d=0.5 s=0 r=0.25 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.615" },
+    { "LOFI PLUCK", "wave=9 m1=32 m1a=0.6 m2=33 m2a=0.3 pos=1 a=0.001 d=0.4 s=0 r=0.2 flt=1 fltcut=1500 fltkey=0.5 mcut=2 md=0.2 sat=1 satdrive=0.4 level=1" },
+    { "DUB PLUCK", "wave=5 a=0.001 d=0.3 s=0 r=0.2 flt=1 fltcut=600 fltres=0.4 fltkey=1 mcut=3.5 md=0.12 dly=1 dlytime=0.5 dlyfb=0.55 dlyping=1 dlymix=0.35 dlytone=0.3 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.731" },
+    { "RESO PLUCK", "wave=4 a=0.001 d=0.4 s=0 r=0.2 flt=1 fltcut=350 fltres=0.75 fltkey=1 mcut=5 md=0.2 level=0.384" },
+    { "GLASS PLUCK", "wave=33 a=0.001 d=0.7 s=0 r=0.4 flt=1 fltcut=2500 fltkey=1 mcut=1.5 md=0.3 plt=1 pltmix=0.25 pltdecay=0.7 level=0.709" },
+    { "WOOD PLUCK", "wave=17 a=0.001 d=0.15 s=0 r=0.08 noise=0.15 ntone=3 ndecay=0.02 level=0.533" },
+    { "OCTAVE PLUCK", "wave=4 m1=15 m1a=0.7 pos=1 a=0.001 d=0.35 s=0 r=0.2 flt=1 fltcut=700 fltkey=1 mcut=3.5 md=0.2 dly=1 dlytime=0.25 dlymix=0.15 level=0.719" },
+    { "BUBBLE PLUCK", "wave=0 mpitch=12 md=0.03 a=0.001 d=0.3 s=0 r=0.15 dly=1 dlytime=0.3 dlyping=1 dlyfb=0.35 dlymix=0.25 level=0.639" },
+    { "ZAP PLUCK", "wave=4 mpitch=24 md=0.05 a=0.001 d=0.35 s=0 r=0.15 flt=1 fltcut=600 fltkey=1 mcut=3 fltres=0.3 level=0.736" },
+    { "ACID 303", "wave=4 a=0.002 d=0.6 s=0.5 r=0.08 glide=0.08 flt=1 fltcut=650 fltres=0.95 fltkey=0.5 mcut=3.5 md=0.18 sat=1 satdrive=0.4 satmix=0.6 level=0.394" },
+    { "ACID SQUARE", "wave=2 a=0.002 d=0.6 s=0.5 r=0.08 glide=0.08 flt=1 fltcut=700 fltres=0.93 fltkey=0.5 mcut=3.5 md=0.2 dst=1 dstdrive=0.25 dstmix=0.3 level=0.316" },
+    { "SUPERSAW LEAD", "wave=4 voices=9 spread=1 cdetl=0.55 cdetc=0.25 cdetr=0.55 phase=1 a=0.005 r=0.3 flt=1 fltcut=9000 dly=1 dlytime=0.375 dlymix=0.18 plt=1 pltmix=0.2 level=0.411" },
+    { "SAW LEAD", "wave=4 voices=2 spread=0.3 cdetl=0.1 cdetr=0.1 glide=0.05 vibdepth=0.15 vibdelay=0.4 vibrate=5.5 flt=1 fltcut=6000 dly=1 dlytime=0.3 dlymix=0.15 level=0.516" },
+    { "SQUARE LEAD", "wave=2 glide=0.05 vibdepth=0.12 vibdelay=0.4 flt=1 fltcut=5000 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.53" },
+    { "SYNC LEAD", "wave=4 m1=8 m1a=0.8 pos=0.5 lfopos=0.3 lforate=0.3 flt=1 fltcut=8000 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.605" },
+    { "CHIP LEAD", "wave=5 vibdepth=0.25 vibrate=7 vibdelay=0.2 a=0.001 r=0.05 level=0.543" },
+    { "SINE LEAD", "wave=0 glide=0.06 vibdepth=0.15 vibdelay=0.35 vibrate=5.5 dly=1 dlytime=0.33 dlymix=0.2 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.681" },
+    { "FM LEAD", "wave=0 m1=17 m1a=0.6 m2=16 m2a=0.3 pos=1 vibdepth=0.1 vibdelay=0.4 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.537" },
+    { "BRASS SYNTH", "wave=4 voices=3 spread=0.6 cdetl=0.2 cdetr=0.2 phase=1 a=0.06 d=0.5 s=0.7 r=0.25 flt=1 fltcut=700 fltkey=0.5 mcut=2.5 ma=0.05 md=0.4 cho=1 chomix=0.25 level=0.725" },
+    { "POLY SYNTH", "wave=63 voices=4 spread=0.7 cdetl=0.2 cdetr=0.2 phase=1 a=0.01 d=0.8 s=0.6 r=0.4 flt=1 fltcut=2500 fltres=0.2 fltkey=0.5 mcut=1.5 md=0.5 cho=1 chomix=0.3 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.646" },
+    { "HOUSE STAB", "wave=19 a=0.002 d=0.3 s=0 r=0.1 flt=1 fltcut=3500 fltkey=0.5 plt=1 pltmix=0.2 pltdecay=0.5 level=0.663" },
+    { "RAVE HOOVER", "wave=4 m1=5 m1a=0.5 pos=1 voices=5 spread=1 cdetl=0.6 cdetc=0.3 cdetr=0.6 phase=1 mpitch=-4 md=0.25 a=0.002 d=0.6 s=0.6 r=0.3 cho=1 chomix=0.5 chodepth=0.8 level=0.697" },
+    { "VOCAL SYNTH", "wave=26 m1=56 m1a=0.9 pos=0.5 lfopos=0.9 lforate=0.35 vibdepth=0.1 vibdelay=0.4 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.478" },
+    { "PWM LEAD", "wave=2 m1=5 m1a=0.7 pos=0.4 lfopos=0.7 lforate=0.6 flt=1 fltcut=6000 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.55" },
+    { "HARD LEAD", "wave=4 dst=1 dsttype=0 dstdrive=0.55 dstmix=0.7 dsttone=0.85 flt=1 fltcut=10000 vibdepth=0.12 vibdelay=0.5 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.846" },
+    { "SUB BASS", "wave=0 oct=-2 a=0.005 r=0.12 level=0.558" },
+    { "DEEP SUB", "wave=0 m1=24 m1a=0.25 pos=1 oct=-3 a=0.005 r=0.15 level=0.558" },
+    { "808 BASS", "wave=0 oct=-2 mpitch=12 md=0.06 a=0.001 d=2.5 s=0 r=0.3 sat=1 satdrive=0.3 level=1" },
+    { "REESE BASS", "wave=4 oct=-2 voices=2 spread=0.3 cdetl=0.3 cdetr=0.3 phase=0 flt=1 fltcut=900 fltres=0.1 fltkey=0.3 level=0.493" },
+    { "ACID BASS", "wave=4 oct=-1 a=0.002 d=0.6 s=0.5 r=0.06 glide=0.06 flt=1 fltcut=420 fltres=0.93 fltkey=0.5 mcut=3.5 md=0.15 level=0.272" },
+    { "SAW BASS", "wave=4 oct=-2 flt=1 fltcut=600 fltkey=0.5 fltres=0.15 a=0.003 r=0.08 level=0.718" },
+    { "SQUARE BASS", "wave=2 oct=-2 flt=1 fltcut=800 fltkey=0.5 a=0.003 r=0.08 level=0.634" },
+    { "FM BASS", "wave=0 m1=16 m1a=0.7 pos=0 mpos=1 md=0.25 oct=-2 a=0.002 d=0.8 s=0.7 r=0.1 level=0.567" },
+    { "PLUCK BASS", "wave=4 oct=-2 a=0.001 d=0.5 s=0.15 r=0.08 flt=1 fltcut=200 fltkey=0.5 mcut=4 md=0.12 level=0.692" },
+    { "HOUSE BASS", "wave=16 oct=-2 a=0.002 d=0.35 s=0.4 r=0.06 flt=1 fltcut=1200 fltkey=0.5 level=0.604" },
+    { "WOBBLE BASS", "wave=4 m1=40 m1a=0.9 pos=0.5 lfopos=1 lforate=2.67 oct=-2 a=0.003 r=0.1 dst=1 dstdrive=0.2 dstmix=0.3 level=0.606" },
+    { "FINGER BASS", "wave=14 m1=44 m1a=0.55 pos=1 oct=-2 a=0.003 d=2 s=0 r=0.12 flt=1 fltcut=300 fltkey=0.6 mcut=2 md=0.3 noise=0.08 ntone=6 ndecay=0.02 level=0.61" },
+    { "PICKED BASS", "wave=4 m1=44 m1a=0.6 pos=1 oct=-2 a=0.002 d=2.5 s=0 r=0.1 flt=1 fltcut=450 fltkey=0.6 mcut=3 md=0.2 noise=0.15 ntone=8 ndecay=0.015 level=0.633" },
+    { "UPRIGHT BASS", "wave=14 oct=-2 a=0.003 d=1.2 s=0 r=0.15 flt=1 fltcut=250 fltkey=0.6 mcut=1.5 md=0.1 noise=0.1 ntone=2 ndecay=0.05 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.681" },
+    { "MOOG BASS", "wave=4 voices=2 spread=0 cdetl=0.05 cdetr=0.05 oct=-2 a=0.003 d=1 s=0.8 r=0.1 flt=1 fltcut=250 fltres=0.5 fltkey=0.5 mcut=3 md=0.3 sat=1 satdrive=0.3 level=1" },
+    { "GROWL BASS", "wave=4 m1=20 m1a=0.8 m2=26 m2a=0.5 pos=0.5 lfopos=0.95 lforate=4 oct=-2 dst=1 dstdrive=0.3 dstmix=0.4 level=0.68" },
+    { "AMBIENT DRONE", "wave=25 m1=43 m1a=0.7 m2=9 m2a=0.45 pos=0.3 envpos=0.15 lfopos=0.25 lforate=0.07 voices=8 spread=0.85 cdetl=0.55 cdetc=0.2 cdetr=0.55 centl=0.35 centc=0.25 centr=0.35 caggl=0.15 caggr=0.15 cposl=0.38 cposr=0.62 clvll=0.8 clvlr=0.8 phase=1 a=1.2 d=2.5 s=0.75 r=5 flt=1 fltcut=5000 fltenv=0.2 fltres=0.15 cho=1 chomix=0.35 dly=1 dlytime=0.42 dlyfb=0.45 dlyping=0.6 dlytone=0.45 dlymix=0.25 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=1" },
+    { "WARM PAD", "wave=9 voices=6 spread=0.8 cdetl=0.3 cdetc=0.1 cdetr=0.3 phase=1 a=1.2 r=3 flt=1 fltcut=1200 fltkey=0.3 cho=1 chomix=0.3 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.29" },
+    { "GLASS PAD", "wave=33 voices=4 spread=1 cdetl=0.1 cdetr=0.1 phase=1 a=1 r=4 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.461" },
+    { "CHOIR PAD", "wave=31 m1=56 m1a=0.6 pos=0.4 lfopos=0.3 lforate=0.08 voices=8 spread=1 cdetl=0.2 cdetc=0.1 cdetr=0.2 phase=1 vibdepth=0.08 vibrate=5 a=1.5 r=4 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.32" },
+    { "STRING PAD", "wave=25 voices=8 spread=1 cdetl=0.25 cdetc=0.1 cdetr=0.25 centc=0.2 phase=1 vibdepth=0.08 vibrate=5.5 a=1 r=3 flt=1 fltcut=4000 cho=1 chomix=0.3 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.321" },
+    { "DARK PAD", "wave=9 oct=-1 voices=4 spread=0.9 cdetl=0.15 cdetr=0.15 phase=1 a=2 r=5 flt=1 fltcut=450 fltkey=0.3 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.401" },
+    { "SHIMMER PAD", "wave=16 m1=15 m1a=0.6 pos=1 oct=1 voices=6 spread=1 cdetl=0.1 cdetr=0.1 phase=1 a=2 r=6 dly=1 dlyping=1 dlyfb=0.6 dlymix=0.35 dlytime=0.45 plt=1 pltmix=0.5 pltdecay=0.9 level=0.358" },
+    { "EVOLVING PAD", "wave=46 m1=53 m1a=0.6 m2=17 m2a=0.5 pos=0.5 lfopos=1 lforate=0.3 voices=6 spread=1 cdetl=0.2 cdetr=0.2 cposl=0.3 cposr=0.7 phase=1 a=1.5 r=4 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.362" },
+    { "VOWEL PAD", "wave=26 m1=56 m1a=1 pos=0.5 lfopos=1 lforate=0.25 voices=6 spread=1 cdetl=0.15 cdetr=0.15 phase=1 a=1.2 r=4 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.362" },
+    { "WIND PAD", "wave=0 noise=0.9 ntone=3 a=2 r=4 voices=2 spread=1 cho=1 chomix=0.5 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.149" },
+    { "ANALOG PAD", "wave=4 voices=4 spread=0.9 cdetl=0.3 cdetr=0.3 phase=1 a=0.8 r=3 flt=1 fltcut=1500 fltres=0.2 fltkey=0.3 cho=1 chomix=0.5 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.458" },
+    { "PWM PAD", "wave=2 m1=5 m1a=0.6 pos=0.4 lfopos=0.7 lforate=0.2 voices=4 spread=0.9 cdetl=0.15 cdetr=0.15 phase=1 a=1 r=3 flt=1 fltcut=3000 cho=1 chomix=0.4 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.432" },
+    { "FM PAD", "wave=0 m1=17 m1a=0.5 pos=0.3 envpos=0.4 voices=4 spread=1 cdetl=0.15 cdetr=0.15 phase=1 a=1.5 r=3 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.242" },
+    { "SPACE PAD", "wave=9 m1=40 m1a=0.5 pos=1 voices=6 spread=1 cdetl=0.2 cdetr=0.2 phase=1 a=1.5 r=5 cho=1 chomix=0.3 dly=1 dlyping=1 dlyfb=0.55 dlymix=0.4 dlytime=0.6 plt=1 pltmix=0.5 pltdecay=0.9 level=0.37" },
+    { "CRYSTAL PAD", "wave=32 oct=1 voices=6 spread=1 cdetl=0.1 cdetr=0.1 phase=1 a=0.8 r=5 trem=0.2 vibrate=3 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.376" },
+    { "SWELL PAD", "wave=9 voices=4 spread=0.8 cdetl=0.2 cdetr=0.2 phase=1 a=3 s=0.8 d=2 r=4 flt=1 fltcut=400 fltenv=0.7 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.306" },
+    { "FLUTE", "wave=21 oct=1 a=0.08 d=0.5 s=0.85 r=0.15 noise=0.12 ntone=4 vibdepth=0.12 vibrate=5 vibdelay=0.3 trem=0.1 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.454" },
+    { "PICCOLO", "wave=21 oct=2 a=0.06 d=0.5 s=0.85 r=0.12 noise=0.06 ntone=3 vibdepth=0.1 vibrate=5.5 vibdelay=0.3 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.444" },
+    { "RECORDER", "wave=21 m1=40 m1a=0.4 pos=1 oct=1 a=0.04 r=0.08 noise=0.08 ntone=3 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.428" },
+    { "PAN FLUTE", "wave=0 oct=1 a=0.06 r=0.2 noise=0.35 ntone=1.5 vibdepth=0.08 vibrate=5 vibdelay=0.3 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.234" },
+    { "OCARINA", "wave=0 m1=15 m1a=0.1 pos=1 oct=1 a=0.05 r=0.1 noise=0.05 ntone=2 vibdepth=0.1 vibrate=5 vibdelay=0.4 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.461" },
+    { "SHAKUHACHI", "wave=21 a=0.15 r=0.25 noise=0.3 ntone=2 vibdepth=0.3 vibrate=4.5 vibdelay=0.5 mpitch=-0.5 md=0.3 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.207" },
+    { "CLARINET", "wave=22 a=0.04 s=0.9 d=0.5 r=0.1 flt=1 fltcut=3500 fltkey=0.5 noise=0.03 ntone=6 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.661" },
+    { "BASS CLARINET", "wave=22 oct=-1 a=0.05 s=0.9 d=0.5 r=0.12 flt=1 fltcut=1500 fltkey=0.5 noise=0.03 ntone=6 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.574" },
+    { "OBOE", "wave=23 a=0.04 s=0.9 r=0.1 eq=1 eqmid=6 eqfreq=1200 vibdepth=0.1 vibrate=5.5 vibdelay=0.3 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.359" },
+    { "BASSOON", "wave=4 m1=43 m1a=0.25 pos=1 oct=-1 a=0.05 s=0.9 r=0.12 flt=1 fltcut=2500 fltkey=0.5 vibdepth=0.06 vibdelay=0.4 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.627" },
+    { "ALTO SAX", "wave=4 m1=43 m1a=0.4 pos=1 a=0.04 s=0.9 r=0.1 sat=1 satdrive=0.25 satmix=0.5 vibdepth=0.2 vibrate=5 vibdelay=0.4 noise=0.05 ntone=8 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.564" },
+    { "TENOR SAX", "wave=4 m1=43 m1a=0.45 pos=1 oct=-1 a=0.05 s=0.9 r=0.12 sat=1 satdrive=0.3 satmix=0.5 vibdepth=0.2 vibrate=5 vibdelay=0.4 noise=0.06 ntone=8 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.567" },
+    { "TRUMPET", "wave=24 m1=43 m1a=0.15 pos=1 a=0.05 d=0.3 s=0.8 r=0.1 flt=1 fltcut=2500 fltkey=0.6 fltenv=0.6 mpitch=-0.6 md=0.05 vibdepth=0.08 vibdelay=0.5 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.617" },
+    { "TROMBONE", "wave=24 oct=-1 a=0.05 d=0.3 s=0.8 r=0.12 flt=1 fltcut=1000 fltkey=0.6 fltenv=0.5 mpitch=-0.4 md=0.06 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.636" },
+    { "FRENCH HORN", "wave=24 m1=40 m1a=0.82 pos=1 oct=-1 a=0.08 d=0.4 s=0.85 r=0.2 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.545" },
+    { "TUBA", "wave=24 m1=40 m1a=0.78 pos=1 oct=-2 a=0.06 d=0.4 s=0.85 r=0.15 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.585" },
+    { "VIOLIN", "wave=25 a=0.08 d=0.4 s=0.9 r=0.25 eq=1 eqmid=6 eqfreq=2800 eqlow=-3 vibdepth=0.25 vibrate=6 vibdelay=0.3 noise=0.06 ntone=10 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.272" },
+    { "VIOLA", "wave=25 a=0.09 d=0.4 s=0.9 r=0.25 eq=1 eqmid=4 eqfreq=1800 vibdepth=0.22 vibrate=5.5 vibdelay=0.3 noise=0.05 ntone=8 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.334" },
+    { "CELLO", "wave=25 oct=-1 a=0.1 d=0.4 s=0.9 r=0.3 eq=1 eqmid=4 eqfreq=1500 eqlow=2 vibdepth=0.2 vibrate=5 vibdelay=0.3 noise=0.05 ntone=8 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.363" },
+    { "CONTRABASS", "wave=25 oct=-2 a=0.12 d=0.4 s=0.9 r=0.3 flt=1 fltcut=1500 fltkey=0.5 vibdepth=0.15 vibrate=4.8 vibdelay=0.4 noise=0.04 ntone=6 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.538" },
+    { "STRING SECTION", "wave=25 voices=8 spread=1 cdetl=0.25 cdetc=0.15 cdetr=0.25 centl=0.3 centc=0.3 centr=0.3 phase=1 a=0.3 d=0.5 s=0.9 r=0.6 vibdepth=0.1 vibrate=5.5 eq=1 eqmid=4 eqfreq=2500 cho=1 chomix=0.25 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.264" },
+    { "PIZZICATO", "wave=14 m1=44 m1a=0.5 pos=1 a=0.002 d=0.5 s=0 r=0.2 flt=1 fltcut=800 fltkey=1 mcut=2 md=0.15 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.63" },
+    { "NYLON GUITAR", "wave=14 m1=44 m1a=0.5 pos=1 oct=-1 a=0.002 d=3 s=0 r=0.3 flt=1 fltcut=900 fltkey=1 mcut=2 md=0.5 noise=0.06 ntone=5 ndecay=0.015 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.625" },
+    { "STEEL GUITAR", "wave=14 m1=44 m1a=0.83 m2=47 m2a=0.3 pos=1 oct=-1 a=0.002 d=4 s=0 r=0.3 flt=1 fltcut=2000 fltkey=1 mcut=2 md=0.6 noise=0.08 ntone=8 ndecay=0.012 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.618" },
+    { "ELECTRIC CLEAN", "wave=14 m1=44 m1a=0.37 m2=47 m2a=0.2 pos=1 oct=-1 a=0.002 d=6 s=0 r=0.2 flt=1 fltcut=1500 fltkey=0.8 mcut=1 md=0.8 cho=1 chomix=0.3 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.641" },
+    { "ELECTRIC CRUNCH", "wave=4 m1=44 m1a=0.4 pos=1 oct=-1 a=0.002 d=4 s=0.4 r=0.15 dst=1 dsttype=0 dstdrive=0.45 dstmix=1 dsttone=0.5 flt=1 fltcut=3000 fltkey=0.5 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=1" },
+    { "DIST GUITAR", "wave=4 voices=2 spread=0.6 cdetl=0.05 cdetr=0.05 oct=-1 a=0.002 d=3 s=0.9 r=0.15 dst=1 dsttype=0 dstdrive=0.75 dstmix=1 dsttone=0.65 sat=1 satdrive=0.5 eq=1 eqmid=-4 eqfreq=800 vibdepth=0.1 vibdelay=0.6 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.928" },
+    { "UKULELE", "wave=14 m1=44 m1a=0.5 pos=1 a=0.002 d=1.0 s=0 r=0.15 flt=1 fltcut=1500 fltkey=1 mcut=1.5 md=0.2 noise=0.08 ntone=6 ndecay=0.012 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.615" },
+    { "BANJO", "wave=4 m1=44 m1a=1 pos=1 a=0.001 d=0.5 s=0 r=0.1 flt=1 fltcut=2500 fltkey=1 mcut=2 md=0.08 noise=0.12 ntone=10 ndecay=0.01 level=0.644" },
+    { "MANDOLIN", "wave=14 m1=44 m1a=0.5 pos=1 oct=1 voices=2 spread=0.3 cdetl=0.05 cdetr=0.05 a=0.001 d=0.7 s=0 r=0.15 flt=1 fltcut=2500 fltkey=1 mcut=2 md=0.1 noise=0.08 ntone=8 ndecay=0.01 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.452" },
+    { "HARP", "wave=14 m1=62 m1a=0.4 pos=1 a=0.002 d=4 s=0 r=1.5 flt=1 fltcut=1200 fltkey=1 mcut=1 md=0.3 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.468" },
+    { "SITAR", "wave=4 m1=26 m1a=0.4 m2=43 m2a=0.5 pos=1 a=0.002 d=3 s=0 r=0.4 flt=1 fltcut=3000 fltkey=1 mcut=1 md=0.6 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.793" },
+    { "PIANO", "wave=14 m1=44 m1a=0.9 m2=47 m2a=0.25 pos=1 a=0.002 d=4 s=0 r=0.35 flt=1 fltcut=1500 fltkey=1 mcut=2 md=0.8 noise=0.05 ntone=6 ndecay=0.01 voices=2 spread=0.3 cdetl=0.02 cdetr=0.02 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.448" },
+    { "ELECTRIC PIANO", "wave=0 m1=19 m1a=0.35 pos=0 mpos=1 md=0.25 a=0.002 d=3 s=0 r=0.4 trem=0.25 vibrate=4 cho=1 chomix=0.2 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.671" },
+    { "WURLITZER", "wave=11 m1=24 m1a=0.3 m2=47 m2a=0.4 pos=0.4 mpos=0.6 md=0.3 a=0.002 d=2.5 s=0 r=0.3 trem=0.3 vibrate=5.5 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.617" },
+    { "CLAVINET", "wave=5 m1=44 m1a=0.7 pos=1 a=0.001 d=0.8 s=0 r=0.08 flt=1 fltcut=2500 fltkey=1 fltres=0.3 mcut=2 md=0.15 level=0.575" },
+    { "HARPSICHORD", "wave=4 m1=44 m1a=1 pos=1 a=0.001 d=2.5 s=0 r=0.15 flt=1 fltcut=4000 fltkey=1 mcut=1 md=0.3 noise=0.1 ntone=8 ndecay=0.01 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.695" },
+    { "DRAWBAR ORGAN", "wave=19 a=0.005 r=0.05 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.541" },
+    { "JAZZ ORGAN", "wave=18 m1=47 m1a=0.6 pos=0 mpos=1 md=0.3 a=0.004 r=0.05 vibdepth=0.05 vibrate=6.7 trem=0.15 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.532" },
+    { "CHURCH ORGAN", "wave=19 m1=15 m1a=0.5 pos=1 a=0.08 r=0.4 plt=1 pltmix=0.45 pltdecay=0.9 pltdamp=0.3 level=0.371" },
+    { "REED ORGAN", "wave=35 a=0.1 r=0.2 noise=0.03 ntone=6 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.511" },
+    { "ACCORDION", "wave=35 voices=3 spread=1 cdetl=0.35 cdetr=0.35 phase=0 a=0.05 r=0.1 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.418" },
+    { "FM PIANO", "wave=0 m1=16 m1a=0.6 m2=19 m2a=0.25 pos=0 mpos=1 md=0.4 a=0.002 d=2.5 s=0 r=0.3 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.617" },
+    { "TOY PIANO", "wave=32 oct=1 a=0.001 d=0.6 s=0 r=0.15 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.625" },
+    { "HONKY TONK", "wave=14 m1=44 m1a=0.9 m2=47 m2a=0.25 pos=1 a=0.002 d=4 s=0 r=0.35 flt=1 fltcut=1500 fltkey=1 mcut=2 md=0.8 noise=0.05 ntone=6 ndecay=0.01 voices=2 spread=1 cdetl=0.2 cdetr=0.2 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.614" },
+    { "LOFI KEYS", "wave=0 m1=19 m1a=0.3 m2=32 m2a=0.5 pos=0.5 mpos=0.5 md=0.25 a=0.002 d=2.5 s=0 r=0.3 trem=0.2 vibrate=3 vibdepth=0.08 flt=1 fltcut=2000 sat=1 satdrive=0.3 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=1" },
+    { "FELT PIANO", "wave=14 m1=62 m1a=0.5 pos=1 a=0.004 d=3 s=0 r=0.4 flt=1 fltcut=700 fltkey=1 mcut=1 md=0.4 noise=0.04 ntone=2 ndecay=0.02 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.529" },
+    { "COMBO ORGAN", "wave=2 m1=15 m1a=0.5 pos=1 a=0.004 r=0.05 vibdepth=0.08 vibrate=6.5 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.473" },
+    { "MARIMBA", "wave=64 us=1 um=1 h=ff00005900000000000d00000000000000000000000000000000000000000000 m1=40 m1a=0.85 pos=1 mpos=-1 md=0.15 a=0.001 d=0.8 s=0 r=0.3 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.615" },
+    { "XYLOPHONE", "wave=64 us=1 um=1 h=ff007300001a0000000000000000000000000000000000000000000000000000 m1=40 m1a=0.85 pos=1 mpos=-1 md=0.08 oct=1 a=0.001 d=0.35 s=0 r=0.15 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.616" },
+    { "VIBRAPHONE", "wave=64 us=1 um=1 h=ff00004000000000000000000000000000000000000000000000000000000000 m1=40 m1a=0.85 pos=1 mpos=-1 md=0.4 a=0.001 d=3 s=0 r=0.8 trem=0.45 vibrate=5 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.596" },
+    { "GLOCKENSPIEL", "wave=64 us=1 um=1 h=ff004c002e000000000000000000000000000000000000000000000000000000 m1=40 m1a=0.85 pos=1 mpos=-1 md=0.3 oct=2 a=0.001 d=3 s=0 r=1 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.612" },
+    { "CELESTA", "wave=64 us=1 um=1 h=ff1f001400000000000000000000000000000000000000000000000000000000 oct=1 a=0.001 d=1.6 s=0 r=0.5 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.678" },
+    { "MUSIC BOX", "wave=64 us=1 um=1 h=ff401f001a000000000000000000000000000000000000000000000000000000 m1=40 m1a=0.85 pos=1 mpos=-1 md=0.2 oct=2 a=0.001 d=1.8 s=0 r=0.6 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.678" },
+    { "KALIMBA", "wave=64 us=1 um=1 h=ff0000001f000000000000000000000000000000000000000000000000000000 m1=40 m1a=0.85 pos=1 mpos=-1 md=0.05 a=0.001 d=1.5 s=0 r=0.4 noise=0.2 ntone=1 ndecay=0.02 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.618" },
+    { "STEEL DRUM", "wave=64 us=1 um=1 h=ff99592600000000000000000000000000000000000000000000000000000000 m1=40 m1a=0.85 pos=1 mpos=-1 md=0.3 a=0.001 d=1.2 s=0 r=0.3 plt=1 pltmix=0.18 pltdecay=0.5 pltdamp=0.5 level=0.616" },
+    { "TUBULAR BELL", "wave=64 us=1 um=1 h=b2ff800059003300000000000000000000000000000000000000000000000000 m1=40 m1a=0.85 pos=1 mpos=-1 md=1 oct=1 a=0.001 d=6 s=0 r=4 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.551" },
+    { "HANDBELL", "wave=64 us=1 um=1 h=ff0080001a000000000000000000000000000000000000000000000000000000 m1=40 m1a=0.85 pos=1 mpos=-1 md=0.8 oct=1 a=0.001 d=4 s=0 r=3 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.519" },
+    { "CHURCH BELL", "wave=64 us=1 um=1 h=80ff66bf40330000000000000000000000000000000000000000000000000000 m1=40 m1a=0.85 pos=1 mpos=-1 md=1.5 oct=-1 a=0.001 d=8 s=0 r=6 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.532" },
+    { "GAMELAN", "wave=64 us=1 um=1 h=ff4c800000000000000000000000000000000000000000000000000000000000 voices=2 spread=1 cdetl=0.4 cdetr=0.4 m1=40 m1a=0.85 pos=1 mpos=-1 md=0.5 a=0.001 d=3 s=0 r=1.5 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.664" },
+    { "SINGING BOWL", "wave=64 us=1 um=1 h=ff00400000000000000000000000000000000000000000000000000000000000 voices=2 spread=0.6 cdetl=0.03 cdetr=0.03 a=0.005 d=8 s=0 r=6 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.293" },
+    { "FM BELL", "wave=0 m1=19 m1a=0.6 m2=17 m2a=0.3 pos=0.2 mpos=0.8 md=1.5 a=0.001 d=5 s=0 r=2 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.353" },
+    { "CRYSTAL BELL", "wave=33 oct=2 a=0.001 d=3 s=0 r=1.5 plt=1 pltmix=0.35 pltdecay=0.85 pltdamp=0.4 pltpre=0.03 level=0.788" },
+    { "WOOD BLOCK", "wave=64 us=1 um=1 h=ff004c0000000000000000000000000000000000000000000000000000000000 oct=1 a=0.001 d=0.12 s=0 r=0.05 noise=0.3 ntone=2 ndecay=0.015 level=0.465" },
+};
+// WV_FACTORY_END
+
+typedef struct { bool used; char name[33]; char *data; } WvUserPreset;
+static WvUserPreset wv_users[WV_NPRESET];
+static char *wv_strdup(const char *s) { size_t n = strlen(s) + 1; char *d = malloc(n); if (d) memcpy(d, s, n); return d; }
+static bool wv_usersLoaded;
+
+static char *read_file(const char *path);
+static bool  write_file(const char *path, const char *text);
+static void  fs_sync(void);
+static bool  fs_ready(void);
+
+#if defined(PLATFORM_WEB)
+#define WV_USER_DIR "/raya/wavor"
+#else
+#define WV_USER_DIR "raya-data/wavor"
+#endif
+
+static const char *wv_user_path(int slot) { return TextFormat(WV_USER_DIR "/u%03d.txt", slot + 1); }
+
+static void wv_users_scan(void)
+{
+    if (wv_usersLoaded || !fs_ready()) return;
+    wv_usersLoaded = true;
+    MakeDirectory(WV_USER_DIR);
+    for (int i = 0; i < WV_NPRESET; i++) {
+        char *t = read_file(wv_user_path(i));
+        if (!t) continue;
+        char *nl = strchr(t, '\n');
+        if (nl) {
+            *nl = 0;
+            wv_users[i].used = true;
+            snprintf(wv_users[i].name, sizeof wv_users[i].name, "%s", t);
+            wv_users[i].data = wv_strdup(nl + 1);
+        }
+        free(t);
+    }
+}
+
+static unsigned wv_sound_sig(const WavorSt *s)   // what the sound is made of, to show unsaved edits
+{
+    unsigned h = 2166136261u;
+    const unsigned char *b = (const unsigned char *)s->q;
+    for (size_t i = 0; i < sizeof s->q; i++) h = (h ^ b[i]) * 16777619u;
+    if ((int)s->q[WQ_WAVE] == WV_USER) {
+        b = (const unsigned char *)s->user;
+        for (size_t i = 0; i < sizeof s->user; i++) h = (h ^ b[i]) * 16777619u;
+        b = (const unsigned char *)s->part;
+        for (size_t i = 0; i < sizeof s->part; i++) h = (h ^ b[i]) * 16777619u;
+        h = (h ^ (unsigned)s->userMode) * 16777619u;
+    }
+    return h;
+}
+
+static void wv_reset(WavorSt *s)
+{
+    for (int i = 0; i < WQ_N; i++) s->q[i] = WVP[i].k.def;
+    for (int j = 0; j < WV_UPTS; j++) s->user[j] = sinf(TAU * j / WV_UPTS);
+    memset(s->part, 0, sizeof s->part);
+    s->part[0] = 1;
+    s->userMode = 0; s->userSet = false; s->drawMode = false;
+    wv_parse(s, WV_INIT);
+}
+
+// idx: 0..127 factory, 128..255 user slot, -1 the init sound
+static void wv_load_preset(Module *m, int idx)
+{
+    WavorSt *s = m->st;
+    if (idx >= WV_NPRESET && (idx >= 2 * WV_NPRESET || !wv_users[idx - WV_NPRESET].used)) return;
+    wv_reset(s);
+    if (idx >= 0 && idx < WV_NPRESET) { wv_parse(s, WV_FACTORY[idx].data); snprintf(s->pname, sizeof s->pname, "%s", WV_FACTORY[idx].name); }
+    else if (idx >= WV_NPRESET) { wv_parse(s, wv_users[idx - WV_NPRESET].data); snprintf(s->pname, sizeof s->pname, "%s", wv_users[idx - WV_NPRESET].name); }
+    else snprintf(s->pname, sizeof s->pname, "INIT");
+    s->pidx = idx;
+    s->psig = wv_sound_sig(s);
+    wv_work(m, 1e9);
+}
+
+static void wv_user_store(Module *m, int slot, const char *name)
+{
+    WavorSt *s = m->st;
+    static char data[4096];
+    data[0] = 0;
+    snprintf(s->pname, sizeof s->pname, "%s", name);
+    s->pidx = WV_NPRESET + slot;
+    wv_save(m, data, sizeof data);
+    WvUserPreset *u = &wv_users[slot];
+    free(u->data);
+    u->used = true;
+    u->data = wv_strdup(data);
+    snprintf(u->name, sizeof u->name, "%s", name);
+    MakeDirectory(WV_USER_DIR);
+    if (write_file(wv_user_path(slot), TextFormat("%s\n%s\n", name, data))) fs_sync();
+    s->psig = wv_sound_sig(s);
+    toast(TextFormat("WAVOR: SAVED U%03d %s", slot + 1, name));
+}
+
+static void wv_user_delete(int slot)
+{
+    WvUserPreset *u = &wv_users[slot];
+    free(u->data);
+    memset(u, 0, sizeof *u);
+    remove(wv_user_path(slot));
+    fs_sync();
+}
+
+// Typing a name for a user slot: Enter saves, Escape cancels.
+static void wv_naming(Module *m)
+{
+    WavorSt *s = m->st;
+    int len = (int)strlen(s->nameBuf), ch;
+    while ((ch = GetCharPressed()) > 0)
+        if (ch >= 32 && ch < 127 && ch != '=' && len < 24) { s->nameBuf[len++] = (char)toupper(ch); s->nameBuf[len] = 0; }
+    if ((IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) && len) s->nameBuf[--len] = 0;
+    if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+        wv_user_store(m, s->naming, s->nameBuf[0] ? s->nameBuf : "UNTITLED");
+        s->naming = -1; g_kbd_owner = -1;
+    } else if (IsKeyPressed(KEY_ESCAPE)) { s->naming = -1; g_kbd_owner = -1; }
+}
+
+static void wv_frame(Module *m)   // every video frame
+{
+    WavorSt *s = m->st;
+    wv_users_scan();
+    if (s->naming >= 0 && g_kbd_owner == (int)(m - mods)) wv_naming(m);
+    wv_work(m, 0.004);
+}
+
+// ---- preset bar and browser -------------------------------------------------
+
+static Rectangle wv_body(Rectangle area) { return (Rectangle){ area.x, area.y + WV_BAR, area.width, area.height - WV_BAR }; }
+static Rectangle wv_bar_btn(Rectangle area, int i)   // 0 prev, 1 next, 2 name, 3 save, 4 init
+{
+    static const float X[5] = { 0, 30, 62, 588, 674 }, W[5] = { 26, 26, 520, 80, 70 };
+    return (Rectangle){ area.x + X[i], area.y + 2, W[i], 24 };
+}
+static Rectangle wv_br_tab(Rectangle a, int i) { return (Rectangle){ a.x + 8 + i * 104, a.y + 6, 100, 20 }; }
+static Rectangle wv_br_close(Rectangle a)      { return (Rectangle){ a.x + a.width - 34, a.y + 6, 26, 20 }; }
+static Rectangle wv_br_cell(Rectangle a, int i)
+{
+    float cw = (a.width - 16) / WV_GROUPS, y0 = a.y + 50, ch = (a.height - 58) / 16;
+    return (Rectangle){ a.x + 8 + (i / 16) * cw, y0 + (i % 16) * ch, cw - 4, ch - 3 };
+}
+
+static void wv_draw_bar(WavorSt *s, Rectangle area, Vector2 mp)
+{
+    bool naming = s->naming >= 0;
+    wv_button(wv_bar_btn(area, 0), "<", mp, false);
+    wv_button(wv_bar_btn(area, 1), ">", mp, false);
+    Rectangle nb = wv_bar_btn(area, 2);
+    bool h = CheckCollisionPointRec(mp, nb);
+    DrawRectangleRec(nb, INSET);
+    DrawRectangleLinesEx(nb, 1, naming ? ACCENT : h || s->browse ? ACCENT_DIM : PANEL_HI);
+    if (naming) {
+        const char *t = TextFormat("NAME FOR U%03d:  %s", s->naming + 1, s->nameBuf);
+        txt(t, nb.x + 10, nb.y + 7, 10, ACCENT);
+        if (fmodf((float)GetTime(), 1.0f) < 0.6f) DrawRectangle((int)(nb.x + 12 + txt_w(t, 10)), (int)nb.y + 5, 2, 14, ACCENT);
+        txt("ENTER SAVES, ESC CANCELS", nb.x + nb.width - 10 - txt_w("ENTER SAVES, ESC CANCELS", 10), nb.y + 7, 10, TEXT_DIM);
+    } else {
+        const char *id = s->pidx < 0 ? "----" : s->pidx < WV_NPRESET ? TextFormat("F%03d", s->pidx + 1) : TextFormat("U%03d", s->pidx - WV_NPRESET + 1);
+        const char *grp = s->pidx < 0 ? "" : s->pidx < WV_NPRESET ? WV_GROUP[s->pidx / 16] : "USER";
+        bool mod = wv_sound_sig(s) != s->psig;
+        txt(id, nb.x + 10, nb.y + 7, 10, TEXT_DIM);
+        txt(grp, nb.x + 52, nb.y + 7, 10, TEXT_DIM);
+        txt(TextFormat("%s%s", s->pname[0] ? s->pname : "DEFAULT", mod ? "  *" : ""), nb.x + 120, nb.y + 7, 10, h ? ACCENT : TEXT);
+        txt("BROWSE", nb.x + nb.width - 10 - txt_w("BROWSE", 10), nb.y + 7, 10, h ? ACCENT : TEXT_DIM);
+    }
+    wv_button(wv_bar_btn(area, 3), "SAVE", mp, s->browse && s->saveMode);
+    wv_button(wv_bar_btn(area, 4), "INIT", mp, false);
+    int nu = 0;
+    for (int i = 0; i < WV_NPRESET; i++) nu += wv_users[i].used;
+    const char *info = TextFormat("%d FACTORY  -  %d / %d USER", WV_NPRESET, nu, WV_NPRESET);
+    txt(info, area.x + area.width - txt_w(info, 10), area.y + 9, 10, TEXT_DIM);
+}
+
+static void wv_draw_browser(WavorSt *s, Rectangle a, Vector2 mp)
+{
+    DrawRectangleRec(a, (Color){ 26, 28, 30, 255 });
+    DrawRectangleLinesEx(a, 1, ACCENT_DIM);
+    wv_button(wv_br_tab(a, 0), "FACTORY", mp, s->browseTab == 0);
+    wv_button(wv_br_tab(a, 1), "USER", mp, s->browseTab == 1);
+    wv_button(wv_br_close(a), "X", mp, false);
+    const char *hint = s->browseTab == 0 ? "CLICK A PRESET TO LOAD IT" :
+                       s->saveMode ? "CLICK A SLOT TO SAVE THE CURRENT SOUND THERE, THEN TYPE A NAME" :
+                       "CLICK TO LOAD  -  RIGHT-CLICK TWICE TO DELETE";
+    txt(hint, a.x + 224, a.y + 11, 10, s->saveMode && s->browseTab == 1 ? ACCENT : TEXT_DIM);
+    for (int g = 0; g < WV_GROUPS; g++) {
+        Rectangle c = wv_br_cell(a, g * 16);
+        txt(s->browseTab == 0 ? WV_GROUP[g] : TextFormat("U%03d - U%03d", g * 16 + 1, g * 16 + 16), c.x + 4, a.y + 34, 10, ACCENT);
+    }
+    for (int i = 0; i < WV_NPRESET; i++) {
+        Rectangle c = wv_br_cell(a, i);
+        int idx = s->browseTab == 0 ? i : WV_NPRESET + i;
+        bool used = s->browseTab == 0 || wv_users[i].used, h = CheckCollisionPointRec(mp, c), on = idx == s->pidx;
+        bool armed = s->browseTab == 1 && s->armDel == i;
+        DrawRectangleRec(c, armed ? fade(CABLE_COLORS[1], 0.3f) : on ? fade(ACCENT, 0.18f) : h ? PANEL_HI : (Color){ 36, 38, 40, 255 });
+        if (on || h) DrawRectangleLinesEx(c, 1, on ? ACCENT : ACCENT_DIM);
+        const char *name = s->browseTab == 0 ? WV_FACTORY[i].name : used ? wv_users[i].name : "EMPTY";
+        if (s->browseTab == 1) txt(TextFormat("U%03d", i + 1), c.x + 5, c.y + c.height / 2 - 5, 10, fade(TEXT_DIM, 0.7f));
+        txt(name, c.x + (s->browseTab == 1 ? 40 : 6), c.y + c.height / 2 - 5, 10, armed ? CABLE_COLORS[1] : on || h ? ACCENT : used ? TEXT : fade(TEXT_DIM, 0.5f));
+    }
+}
+
+static void wv_step_preset(Module *m, int d)
+{
+    WavorSt *s = m->st;
+    if (s->pidx >= WV_NPRESET) {   // step through the used user slots
+        for (int k = 1; k <= WV_NPRESET; k++) {
+            int i = ((s->pidx - WV_NPRESET) + d * k + 2 * WV_NPRESET) % WV_NPRESET;
+            if (wv_users[i].used) { wv_load_preset(m, WV_NPRESET + i); return; }
+        }
+        return;
+    }
+    wv_load_preset(m, s->pidx < 0 ? (d > 0 ? 0 : WV_NPRESET - 1) : (s->pidx + d + WV_NPRESET) % WV_NPRESET);
+}
+
+// ---- entry points: the preset bar on top, the panes below --------------------
+
+static void wv_draw(Module *m, Rectangle area)
+{
+    WavorSt *s = m->st;
+    Vector2 mp = GetMousePosition();
+    wv_draw_bar(s, area, mp);
+    if (s->browse) wv_draw_browser(s, wv_body(area), mp);
+    else wv_draw_body(m, wv_body(area));
+}
+
+static bool wv_press(Module *m, Vector2 mp, Rectangle area)
+{
+    WavorSt *s = m->st;
+    Rectangle a = wv_body(area);
+    if (s->naming >= 0) { s->naming = -1; g_kbd_owner = -1; }   // a click elsewhere cancels naming
+    if (CheckCollisionPointRec(mp, wv_bar_btn(area, 0))) { wv_step_preset(m, -1); return true; }
+    if (CheckCollisionPointRec(mp, wv_bar_btn(area, 1))) { wv_step_preset(m, 1); return true; }
+    if (CheckCollisionPointRec(mp, wv_bar_btn(area, 2))) {
+        s->browse = !s->browse; s->saveMode = false; s->pick = -1;
+        s->browseTab = s->pidx >= WV_NPRESET ? 1 : 0;
+        return true;
+    }
+    if (CheckCollisionPointRec(mp, wv_bar_btn(area, 3))) { s->browse = true; s->saveMode = true; s->browseTab = 1; s->pick = -1; return true; }
+    if (CheckCollisionPointRec(mp, wv_bar_btn(area, 4))) { wv_load_preset(m, -1); s->browse = false; return true; }
+    if (s->browse) {
+        if (CheckCollisionPointRec(mp, wv_br_close(a))) { s->browse = false; return true; }
+        for (int t = 0; t < 2; t++) if (CheckCollisionPointRec(mp, wv_br_tab(a, t))) { s->browseTab = t; s->armDel = -1; if (!t) s->saveMode = false; return true; }
+        for (int i = 0; i < WV_NPRESET; i++)
+            if (CheckCollisionPointRec(mp, wv_br_cell(a, i))) {
+                s->armDel = -1;
+                if (s->browseTab == 0) { wv_load_preset(m, i); s->browse = false; }
+                else if (s->saveMode) {   // name it in the bar, Enter saves
+                    s->naming = i; g_kbd_owner = (int)(m - mods);
+                    snprintf(s->nameBuf, sizeof s->nameBuf, "%s", wv_users[i].used ? wv_users[i].name : s->pname[0] ? s->pname : "MY SOUND");
+                    while (GetCharPressed() > 0) {}
+                    s->browse = false; s->saveMode = false;
+                } else if (wv_users[i].used) { wv_load_preset(m, WV_NPRESET + i); s->browse = false; }
+                return true;
+            }
+        return true;
+    }
+    if (mp.y < a.y) return false;
+    return wv_press_body(m, mp, a);
+}
+
+static void wv_drag_main(Module *m, Vector2 mp, Rectangle area) { wv_drag(m, mp, wv_body(area)); }
+
+static bool wv_wheel(Module *m, Vector2 mp, Rectangle area, float w)
+{
+    WavorSt *s = m->st;
+    if (CheckCollisionPointRec(mp, wv_bar_btn(area, 2))) { wv_step_preset(m, w > 0 ? -1 : 1); return true; }
+    if (s->browse) return true;
+    return wv_wheel_body(m, mp, wv_body(area), w);
+}
+
+static bool wv_rpress(Module *m, Vector2 mp, Rectangle area)
+{
+    WavorSt *s = m->st;
+    Rectangle a = wv_body(area);
+    if (s->browse) {
+        if (s->browseTab == 1)
+            for (int i = 0; i < WV_NPRESET; i++)
+                if (CheckCollisionPointRec(mp, wv_br_cell(a, i)) && wv_users[i].used) {
+                    if (s->armDel == i) {
+                        wv_user_delete(i); s->armDel = -1;
+                        if (s->pidx == WV_NPRESET + i) s->pidx = -1;
+                    } else s->armDel = i;
+                    return true;
+                }
+        return true;
+    }
+    return wv_rpress_body(m, mp, a);
 }
 
 // ---------------------------------------------------------------------------
@@ -4861,7 +5379,7 @@ static const ModDef DEFS[M_COUNT] = {
         .save = arr_save, .load = arr_load, .wheel = arr_wheel, .rpress = arr_rpress },
     [M_WAVOR] = { .name = "WAVOR", .w = WV_W, .customH = WV_H, .nin = 7, .nout = 2, .nknob = 0,
         .ins = { "P1", "P2", "P3", "P4", "GATE", "POS", "CUTOFF" }, .outs = { "L", "R" },
-        .init = wv_init, .process = wv_process, .draw = wv_draw, .press = wv_press, .drag = wv_drag,
+        .init = wv_init, .process = wv_process, .draw = wv_draw, .press = wv_press, .drag = wv_drag_main,
         .save = wv_save, .load = wv_load, .fini = wv_fini, .wheel = wv_wheel, .rpress = wv_rpress },
 };
 
@@ -5030,6 +5548,8 @@ static const char *knob_text(const KnobDef *k, float v)
     case F_LABEL: return k->labels[clampi((int)roundf(v - k->min), 0, (int)(k->max - k->min))];
     case F_DB:    return TextFormat("%+.1f DB", v);
     case F_RATIO: return TextFormat("%.1f:1", v);
+    case F_OCTS:  return TextFormat("%+.1f OCT", v);
+    case F_SEMIS: return TextFormat("%+.2f ST", v);
     default:     return TextFormat("%.2f", v);
     }
 }
@@ -6584,7 +7104,8 @@ static void handle_input(void)
         return;
     }
 
-    // keyboard
+    // keyboard (unless a module is taking typed text)
+    if (g_kbd_owner < 0) {
     if (IsKeyPressed(KEY_SPACE)) toggle_run();
     if (IsKeyPressed(KEY_R) && !cmd) toggle_rec();
     if (IsKeyPressed(KEY_V) && !cmd) toggle_video();
@@ -6593,6 +7114,7 @@ static void handle_input(void)
     if (IsKeyPressed(KEY_S) && !cmd) { open_save(); return; }
     if (cmd && IsKeyPressed(KEY_A)) for (int i = 0; i < MAX_MODULES; i++) sel[i] = mods[i].alive;
     if (IsKeyPressed(KEY_ESCAPE)) select_none();
+    }
 
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         int pm, pi; bool po;
@@ -6963,7 +7485,7 @@ static void frame(void)
             break;
         }
     for (int i = 0; i < MAX_MODULES; i++)   // build changed wavetables a little each frame
-        if (mods[i].alive && mods[i].type == M_WAVOR) wv_work(&mods[i], 0.004);
+        if (mods[i].alive && mods[i].type == M_WAVOR) wv_frame(&mods[i]);
     handle_audio_files(GetMousePosition());
     handle_input();
     if (ui.recOn && !g_recording) {   // stopped by hand or full: offer to save it

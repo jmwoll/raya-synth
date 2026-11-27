@@ -38,7 +38,7 @@ https://github.com/user-attachments/assets/dedc22cf-9c75-4ca2-8f60-277346a54e30
 | ARPEGGIATOR | Arpeggiates the chord tones patched into N1–N4 (e.g. from CHORDS) over 1–4 octaves: up, down, up-down, down-up, random, walk, converge, diverge or as played. Divide, gate length and chance per step. Plays A minor 7 when nothing is patched. |
 | PERFORMER | Plays solo phrases in any of the 12 keys (see below). |
 | 3X OSC | Three detuned oscillator pairs (sine → triangle → saw), filter, swell envelope, stereo. Pitches from P1–P3, swells on GATE, a drone when GATE is unpatched. |
-| WAVOR | Wavetable / additive / sampling synth: 64 waves or your own, 64 morphers, up to 64 unison voices shaped across the stereo image, and a 10-effect chain (see below). |
+| WAVOR | Wavetable / additive / sampling synth: 64 waves or your own, 64 morphers, up to 64 unison voices shaped across the stereo image, a 10-effect chain, and 128 factory presets plus 128 user slots (see below). |
 | LFO | Slow sine, triangle, smooth drift and sample-and-hold for modulation. |
 | DRUMS | 16 drum kits with 16 pads each, every pad with its own trigger input (see below). |
 | SAMPLER | Plays regions of an audio file between up to 8 markers (see below). |
@@ -99,6 +99,31 @@ The factory preset *electro 128* is a rough reproduction of a 128 BPM electro-ho
 
 WAVOR is a wavetable, additive and sampling synth in one module. The left pane is the voice; the right pane is its effect chain.
 
+- **Presets:** the bar on top holds 128 factory presets in 8 groups of 16, plus 128 user slots. Click the name to browse, use **<** / **>** (or the mouse wheel on the name) to step through them, and **INIT** for a plain saw. A **\*** marks unsaved changes. **SAVE** opens the user slots: click one, type a name, press Enter. Right-click a user slot twice to delete it. User presets are shared by all projects (in IndexedDB on the web, `raya-data/wavor/` natively).
+
+  | Group | Presets |
+  | --- | --- |
+  | PLUCK | digi, house, trance, future, square, chip, soft, FM, lo-fi, dub, reso, glass, wood, octave, bubble, zap |
+  | SYNTH | acid 303, acid square, supersaw, saw, square, sync, chip, sine and FM leads, brass synth, poly synth, house stab, rave hoover, vocal synth, PWM lead, hard lead |
+  | BASS | sub, deep sub, 808, reese, acid, saw, square, FM, pluck, house, wobble, finger, picked, upright, moog-style, growl |
+  | PAD | ambient drone, warm, glass, choir, string, dark, shimmer, evolving, vowel, wind, analog, PWM, FM, space, crystal, swell |
+  | WIND | flute, piccolo, recorder, pan flute, ocarina, shakuhachi, clarinet, bass clarinet, oboe, bassoon, alto and tenor sax, trumpet, trombone, French horn, tuba |
+  | STRING | violin, viola, cello, contrabass, string section, pizzicato, nylon, steel, electric clean, crunch and distorted guitar, ukulele, banjo, mandolin, harp, sitar |
+  | KEYS | piano, electric piano, wurlitzer, clavinet, harpsichord, drawbar, jazz, church and combo organ, reed organ, accordion, FM piano, toy piano, honky-tonk, lo-fi keys, felt piano |
+  | MALLET | marimba, xylophone, vibraphone, glockenspiel, celesta, music box, kalimba, steel drum, tubular bell, handbell, church bell, gamelan, singing bowl, FM bell, crystal bell, wood block |
+
+  Every factory preset was rendered and measured against the acoustics of the real instrument, for example:
+  - the clarinet's odd partials stand far above the even ones;
+  - the oboe and trumpet have their strongest partials in a formant band rather than at the fundamental;
+  - guitars are plucked at about 1/5 of the string, so every 5th partial is missing, and their highs die first;
+  - marimba bars are tuned 1:4:10 and xylophone bars 1:3;
+  - the vibraphone has a 5 Hz motor tremolo;
+  - bowed strings have a 5–7 Hz vibrato;
+  - flutes have breath noise;
+  - pads have slow attacks and are wide.
+
+  These are measurements, not a listening test. The synth is harmonic, so bells approximate their inharmonic partials with the nearest harmonics.
+
 - **Envelope:** ADSR on GATE. With GATE unpatched it holds, so WAVOR drones. P1–P4 take up to four pitches (P1 plays C3 when unpatched), for example the four notes from CHORDS.
 - **Master:** OCTAVE, GLIDE, PHASE RND (0 starts every voice in phase for a unison swoosh, 1 at random), LEVEL. The second row moves the wavetable POSITION: the knob, ENV>POS, and a slow internal LFO (LFO RATE, LFO>POS). The POS input adds to it.
 - **Wavetable:** click the wave name to pick one of 64 waves (sine, triangle, square, 8-bit, saws, pulses, organs, flute, clarinet, brass, strings, five vowels, choir, bells, FM, sync, formant, random, noise and more), or use the mouse wheel on it to step through them.
@@ -118,6 +143,7 @@ WAVOR is a wavetable, additive and sampling synth in one module. The left pane i
   | Texture | vowel sweep, window, resonate, sine shaper, scramble phases, spectral gate, to sine, to saw |
 
   The view shows the whole table as 32 frames, from the plain wave at the front to fully morphed at the back. POSITION picks the frame (bright green), so modulating it sweeps through the morph.
+- **Modulation:** a second envelope (M ATTACK, M DECAY) that moves the filter cutoff, the wavetable position and the pitch, for plucks, acid sweeps, brass blips and 808 drops. Below it are TREMOLO, vibrato (VIB RATE, VIB DEPTH, VIB DELAY so it fades in) and NOISE: breath, bow or pick noise band-passed at N TONE times the pitch, held with the note or a short burst (N DECAY).
 - **Voices:** VOICES makes up to 64 copies of everything above. The stage shows the listener at the bottom and a bar for every voice where it sits in the stereo image. SPREAD sets how wide they spread. Five curves change the voices across the stereo image:
   - **Detune:** how far each voice is detuned, up to ±50 cents.
   - **Aggression:** fades the voice towards a brighter, saturated copy of the table, so it gets more high-frequency content.
@@ -130,7 +156,7 @@ WAVOR is a wavetable, additive and sampling synth in one module. The left pane i
 
   | Effect | Controls |
   | --- | --- |
-  | FILTER | LP/BP/HP/notch, cutoff (follows the envelope and the CUTOFF input), resonance |
+  | FILTER | LP/BP/HP/notch, cutoff (follows the envelope, the mod envelope and the CUTOFF input), resonance, keytrack |
   | EQ | low shelf, mid bell with its frequency, high shelf |
   | SATURATION | warm tanh drive, bias for even harmonics, tone, mix |
   | DISTORTION | clip, fold, bit/rate crush or fuzz; drive, tone, mix |
